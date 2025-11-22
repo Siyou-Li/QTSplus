@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# QTSplus specific ignores
+.vscode/*
+.claude/*
+.code-workspace
+Bench/*
+wandb
+checkpoint
+datasets
+pretrained_models
+config/*
+examples/*
