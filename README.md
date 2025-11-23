@@ -18,87 +18,181 @@ Despite the recent advances in the video understanding ability of multimodal lar
 Given a text query and video tokens, QTSplus dynamically selects the most important visual evidence for the input text query by (i) scoring visual tokens via cross-attention, (ii) predicting an instance-specific retention budget based on the complexity of the query, and (iii) selecting Top-n tokens. Furthermore, a small re-encoder preserves temporal order using absolute time information. Integrated into Qwen2.5-VL, QTSplus compresses the vision stream by up to 89% and reduces end-to-end latency by 28% on long videos.
 ```bash
 QTSplus/
-├── README.md, LICENSE, requirements.txt
+├── README.md, LICENSE, environment.txt
 ├── assets/                     # logo and figures for the project
 ├── src/
 │   ├── dataset/                # dataset classes & synthesis scripts
 │   ├── demo/                   # interactive/demo scripts
 │   ├── model/                  # vision towers, tokenizer, projectors, LLM wrappers
-│   ├── preprocess/             # data‑preprocessing utilities
 │   ├── train/                  # training and fine‑tuning scripts
 │   └── utils/                  # misc helpers (vision preproc, dist utils, etc.)
-└── test/                       # small smoke tests for models & pipelines
+│── preprocess/             # data‑preprocessing utilities
+└── verify/                       # small smoke tests for models & pipelines
 ```
-## 🚀 Quickstart
+## 🚀 Quick Start
 
-The repository is organized so that you can (i) set up the environment, (ii) run QTSplus for inference on your own videos or image sequences, and (iii) optionally reproduce the training/inference pipeline from the paper `res/qtsplus.pdf`.
+### 1. Download Pretrained Models
+| Model    | Download Link|
+|----------|----------|
+| QTSplus-3B | [HuggingFace](https://huggingface.co/AlpachinoNLP/QTSplus-3B)|
+| QTSplus-3B-FT  | [HuggingFace](https://huggingface.co/AlpachinoNLP/QTSplus-3B-FT)|
 
-1. **Clone the repository**
+### 2. Inference Demo
+
+```python
+import os
+import glob
+import torch
+from transformers import AutoModelForCausalLM, AutoProcessor
+from qwen_vl_utils import process_vision_info
+from PIL import Image
+from typing import Optional
+
+# Function to build messages for video or image input
+def build_messages(video: str | None, images_dir: str | None, prompt: str) -> list[dict]:
+    if video:
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": video, "max_pixels": 360 * 420, "fps": 1.0},
+                    {"type": "text", "text": prompt or "Describe this video."},
+                ],
+            }
+        ]
+    if images_dir:
+        image_list = sorted(glob.glob(os.path.join(images_dir, "*.jpeg")))
+        if not image_list:
+            image_list = sorted(glob.glob(os.path.join(images_dir, "*.jpg")))
+        return[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": image_list},
+                        {"type": "text", "text": prompt or "What is in these images?"},
+                    ],
+                }
+            ]
+    else:
+        raise ValueError("Either video path or images directory must be provided.")
+
+# Input Example
+question = "What is happening in the video?"
+video_path = "path/to/video.mp4"  # Set to None if using images
+images_dir = None  
+
+# Load model and processor
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
+
+model = AutoModelForCausalLM.from_pretrained(
+    "AlpachinoNLP/QTSplus-3B",
+    trust_remote_code=True,
+    local_files_only=True,
+).to(dtype=dtype, device=device)
+
+model.eval()
+
+processor = AutoProcessor.from_pretrained(
+    "AlpachinoNLP/QTSplus-3B", trust_remote_code=True, local_files_only=True
+)
+
+# Build messages for the input video or images
+messages = build_messages(video_path, images_dir, question)
+text = processor.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
+)
+
+image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+
+inputs = processor(
+    text=[text],
+    images=None,
+    videos=video_inputs,
+    padding=True,
+    return_tensors="pt",
+    **video_kwargs,
+)
+inputs = inputs.to(dtype=torch.float16, device=device)
+
+# Extract and format the vision input for QTS+ model
+pixel_values_videos = inputs.pop('pixel_values_videos', None)
+video_grid_thw = inputs.pop('video_grid_thw', None)
+inputs.pop('second_per_grid_ts', None)  # Remove unused parameter
+
+# Format vision input as expected by QTS+ model
+vision_input = None
+if pixel_values_videos is not None and video_grid_thw is not None:
+    vision_input = {
+        'pixel_values_videos': pixel_values_videos,
+        'video_grid_thw': video_grid_thw
+    }
+print("="*40)
+# Build question_input_ids from the textual question only (avoid including system/vision tokens)
+question_ids = processor.tokenizer(
+    question,
+    return_tensors="pt",
+    add_special_tokens=False,
+).input_ids.to(dtype=torch.long, device=device)
+
+# Inference
+generated_ids = model.generate(
+    vision_input=vision_input,
+    input_ids=inputs.input_ids,
+    question_input_ids=question_ids,
+    max_new_tokens=256,
+)
+generated_ids_trimmed = [
+    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+]
+output_text = processor.batch_decode(
+    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=True
+)
+# Fallback: if trimming logic yields empty text (common when using inputs_embeds),
+# decode the full sequences instead.
+output_text = [
+    txt if (txt is not None and txt.strip() != "") else processor.decode(ids, skip_special_tokens=True)
+    for txt, ids in zip(output_text, generated_ids)
+]
+print(output_text[0])
+print("="*40)
+```
+
+## 💿 Data
+![](./assets/dataset.svg)
+
+QTSplus is evaluated and trained on long‑video question‑answering data base on ShareGPTVideo.
+
+- ShareGPTVideo(300k Videos + Captions), Qwen3-235B (Text Teacher) 
+- QTS-VSCQ1: Based on ShareGPTVideoChoice(preprocess code in https://github.com/QTSplus/QTSplus-Dataset). Qwen3-235B Converts captions into Visual Single-Choice Questions (VSCQ). Generates options and correct answer key.
+- QTS-VSCQ2: Filtering with Qwen2.5-VL (Vision Teacher). Teacher answers VSCQ1, Keep only if Teacher Answer == Ground Truth.
+- QTS-VQA: Qwen2.5-VL (Vision Teacher) generates free-form QA answers for VSCQ1's questions.
+
+### Example directory layout
+
+For a dataset rooted at `datasets/ShareGPTVideoChoice/train_300k_480p`, a typical layout is:
 
 ```bash
-git clone https://github.com/<your-org>/QTSplus.git
-cd QTSplus
+datasets/ShareGPTVideoChoice/
+├── train_300k_480p/
+│   ├── v_000001/           # directory of frames for one video
+│   │   ├── 000001.jpg
+│   │   ├── 000002.jpg
+│   │   └── ...
+│   └── ...
+└── metadata/
+    └── choice_train.jsonl  # JSONL annotations (one object per example)
 ```
 
-2. **Create the environment and install dependencies**
+The exact filenames and directory names are flexible as long as they are consistent with the `vision_id` values and the `train_base_path` / `val_base_path` arguments passed to `src/train/train.py`.
 
-Either run the provided script (Linux + conda, CUDA 12.8 assumed):
+### Preprocessing and placeholder directories
 
-```bash
-bash environment.sh
-```
+The directory `preprocess/QTSplus-Dataset` is included as a placeholder for dataset preprocessing scripts and artifacts. No raw data is distributed in this repository; please follow the dataset format described above or consult the project website for instructions on obtaining and preprocessing the data used in the paper.
 
-or follow the step‑by‑step instructions in the Installation section below.
-
-3. **Prepare pretrained models**
-
-- Download `Qwen2.5-VL-3B-Instruct` and split it into:
-  - `pretrained_models/Qwen2.5-VL-3B-Instruct-LM`
-  - `pretrained_models/Qwen2.5-VL-3B-Instruct-Vision`
-- Download or train a QTSplus checkpoint and place it in a HuggingFace‑style folder, e.g.:
-  - `checkpoint/QTSplus-3B`
-
-Paths above are the defaults used by the example scripts; you can change them as long as you adjust the corresponding CLI arguments.
-
-4. **Run the QTSplus demo (inference)**
-
-After you have a trained or downloaded QTSplus model:
-
-```bash
-python evaluation/demo.py \
-  --model checkpoint/QTSplus-3B \
-  --video /path/to/video.mp4 \
-  --prompt "Describe this video." \
-  --device cuda:0
-```
-
-Alternatively, you can pass a directory of frames:
-
-```bash
-python evaluation/demo.py \
-  --model checkpoint/QTSplus-3B \
-  --images_dir /path/to/frames_dir \
-  --prompt "What is happening?" \
-  --device cuda:0
-```
-
-The demo script loads the model with `local_files_only=True`, so all model files must be present locally.
-
-5. **(Optional) Evaluate the baseline Qwen2.5‑VL model**
-
-To reproduce the ShareGPTVideoChoice baseline pipeline described in the paper:
-
-```bash
-python evaluation/eval_sharegpt_video_choice.py \
-  --model pretrained_models/Qwen2.5-VL-3B-Instruct \
-  --dataset /path/to/choice_eval.jsonl \
-  --media-base /path/to/train_300k_480p \
-  --out-dir /path/to/output_dir
-```
-
-This script does not use QTSplus; it evaluates the original Qwen2.5‑VL model to provide reference numbers.
-
-## ⚙️ Installation
+## 🚄 Training
+![](./assets/training_process.svg)
+### A. Setup
 
 The repository is designed around a conda‑based Python 3.11 environment with a CUDA‑enabled GPU. The commands below are taken directly from `environment.sh` and provide a reproducible setup on recent Linux distributions.
 
@@ -149,38 +243,13 @@ python -c "import torch, transformers, deepspeed, accelerate; print(torch.cuda.i
 
 which should print `True` on a correctly configured GPU machine.
 
-## 💿 Data
+### B. Prepare pretrained models
 
-QTSplus is evaluated and trained on long‑video question‑answering data. 
-QTS-VSCQ1: based on ShareGPTVideoChoice, a video single‑choice QA dataset(https://github.com/QTSplus/QTSplus-Dataset)
-QTS-VQA: 
-
-### Example directory layout
-
-For a dataset rooted at `datasets/ShareGPTVideoChoice/train_300k_480p`, a typical layout is:
-
+Split Command:
 ```bash
-datasets/ShareGPTVideoChoice/
-├── train_300k_480p/
-│   ├── v_000001/           # directory of frames for one video
-│   │   ├── 000001.jpg
-│   │   ├── 000002.jpg
-│   │   └── ...
-│   └── ...
-└── metadata/
-    └── choice_train.jsonl  # JSONL annotations (one object per example)
+python -m src.utils.separate_qwen2_5_vl.py --model_path <path_to_model>
 ```
-
-The exact filenames and directory names are flexible as long as they are consistent with the `vision_id` values and the `train_base_path` / `val_base_path` arguments passed to `src/train/train.py`.
-
-### Preprocessing and placeholder directories
-
-The directory `preprocess/QTSplus-Dataset` is included as a placeholder for dataset preprocessing scripts and artifacts. No raw data is distributed in this repository; please follow the dataset format described above or consult the project website for instructions on obtaining and preprocessing the data used in the paper.
-
-## 🚄 Training
-**Prepare pretrained models**
-
-- For example: Download `Qwen2.5-VL-3B-Instruct` and split it by running `python -m src.utils.separate_qwen2_5_vl.py --model_path <path_to_model>`, and place the parts into:
+- For example: Download `Qwen2.5-VL-3B-Instruct` and split it, and place the parts into:
   - `<path_to_model>/Qwen2.5-VL-3B-Instruct-LM`
   - `<path_to_model>/Qwen2.5-VL-3B-Instruct-Vision`
 
@@ -188,7 +257,7 @@ Paths above are the defaults used by the example scripts; you can change them as
 
 Training QTSplus is handled by `src/train/train.py` together with `src/train/qts_plus_trainer.py`. The script is designed to be launched via `accelerate` and optionally `deepspeed`.
 
-### Reference training script
+### C. Reference training script
 
 The file `script/training_example.sh` contains a concrete configuration for training QTSplus with Qwen2.5‑VL‑3B:
 
@@ -228,7 +297,7 @@ You should treat this script as a template and adapt:
 - `dataset_type` (`vscq` for multiple‑choice, `vqa` for open‑ended QA).
 - Hyperparameters such as `model_max_length`, learning rate, and QTSplus‑specific parameters (`qts_plus_tau_s`, `qts_plus_nmax`, `qts_plus_rho_min`, `qts_plus_rho_max`, etc.).
 
-### Training logic
+### D. Training logic
 
 At a high level:
 
