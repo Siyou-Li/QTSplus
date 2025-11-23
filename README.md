@@ -356,12 +356,12 @@ If you find this repo useful, please consider citing:
 
 ```bibtex
 @misc{li2025seeingforesttreesqueryaware,
-      title={Seeing the Forest and the Trees: Query-Aware Tokenizer for Long-Video Multimodal Language Models}, 
-      author={Siyou Li and Huanan Wu and Juexi Shao and Yinghao Ma and Yujian Gan and Yihao Luo and Yuwei Wang and Dong Nie and Lu Wang and Wengqing Wu and Le Zhang and Massimo Poesio and Juntao Yu},
-      year={2025},
-      eprint={2511.11910},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2511.11910}, 
+  title        = {Seeing the Forest and the Trees: Query-Aware Tokenizer for Long-Video Multimodal Language Models},
+  author       = {Siyou Li and Huanan Wu and Juexi Shao and Yinghao Ma and Yujian Gan and Yihao Luo and Yuwei Wang and Dong Nie and Lu Wang and Wengqing Wu and Le Zhang and Massimo Poesio and Juntao Yu},
+  year         = {2025},
+  eprint       = {2511.11910},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.CV},
+  url          = {https://arxiv.org/abs/2511.11910}
 }
 ```
