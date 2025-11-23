@@ -5,9 +5,9 @@
   </h1>
 </p>
 
-[![PWC](https://img.shields.io/badge/%F0%9F%93%8E%20arXiv-Paper-red)](https://arxiv.org/abs/2511.11910)
+[![arXiv](https://img.shields.io/badge/arXiv-2511.11910-b31b1b.svg)](https://arxiv.org/abs/2511.11910)
 [![PWC](https://img.shields.io/badge/%F0%9F%8C%8E%20Website-Official%20Page-blue)](https://qtsplus.github.io/)
-[![PWC](https://img.shields.io/badge/HuggingFace-Demo-Green)](https://huggingface.co/collections/AlpachinoNLP/qtsplus)
+[![PWC](https://img.shields.io/badge/HuggingFace-Model-Green)](https://huggingface.co/collections/AlpachinoNLP/qtsplus)
 
 
 ## 🚀 Introduction
