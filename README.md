@@ -5,10 +5,9 @@
   </h1>
 </p>
 
-[![arXiv](https://img.shields.io/badge/arXiv-2511.11910-b31b1b.svg)](https://arxiv.org/abs/2511.11910)
-[![PWC](https://img.shields.io/badge/%F0%9F%8C%8E%20Website-Official%20Page-blue)](https://qtsplus.github.io/)
-[![PWC](https://img.shields.io/badge/HuggingFace-Model-Green)](https://huggingface.co/collections/AlpachinoNLP/qtsplus)
-
+[![arXiv](https://img.shields.io/badge/arXiv-2511.11910-grey?labelColor=B31B1B&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2511.11910)
+[![Website](https://img.shields.io/badge/Website-QTSplus-grey?labelColor=3776AB&logo=GoogleChrome&logoColor=white)](https://qtsplus.github.io/)
+[![HF](https://img.shields.io/badge/Hugging%20Face-Alpachino-grey?labelColor=F26207&logo=huggingface&logoColor=FFD21E)](https://huggingface.co/collections/AlpachinoNLP/qtsplus)
 
 ## 🚀 Introduction
 ![](./assets/qtsplus.svg)
