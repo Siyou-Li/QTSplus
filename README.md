@@ -34,6 +34,7 @@ QTSplus/
 | Model    | Download Link|
 |----------|----------|
 | QTSplus-3B | [HuggingFace](https://huggingface.co/AlpachinoNLP/QTSplus-3B)|
+| QTSplus-7B | [HuggingFace](https://huggingface.co/AlpachinoNLP/QTSplus-7B)|
 | QTSplus-3B-FT  | [HuggingFace](https://huggingface.co/AlpachinoNLP/QTSplus-3B-FT)|
 
 ### 2. Inference Demo
