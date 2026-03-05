@@ -22,7 +22,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file $PROJECT_PATH/confi
     --val_base_path datasets/ShareGPTVideoChoice/train_300k_480p \
     --val_jsonl_path $PROJECT_PATH/datasets/ShareGPTVideoChoice/3b/qa/prediction_correct_train.jsonl \
     --output_dir $PROJECT_PATH/checkpoint/$CHECKPOINT_NAME \
-    --dataset_type qa \
+    --dataset_type vqa \
     --model_max_length 512 \
     --num_train_epochs 8 \
     --per_device_train_batch_size 1 \
@@ -61,4 +61,3 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file $PROJECT_PATH/confi
     --lambda_t 0.1\
     --lambda_m 0.17\
     --lambda_s 0.05
-

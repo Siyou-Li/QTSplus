@@ -14,8 +14,15 @@ import transformers
 import json
 from dataclasses import dataclass, field
 
-from src.model.language_model import QTSplusQwen2_5_VLTextForCausalLM
-from src.model.vision_encoder import Qwen2_5_VLVisionProcessor
+from transformers import AutoTokenizer, AutoImageProcessor
+
+from src.model.language_model import (
+    QTSplusLlama3_ForCausalLM,
+    QTSplusQwen2_5_VLTextForCausalLM,
+    QTSplusInternLM2_ForCausalLM,
+    QTSplusQwen2_ForCausalLM,
+)
+from src.model.vision_encoder import Qwen2_5_VLVisionProcessor, LlavaSiglipVisionProcessor
 from src.model.language_model import Qwen2_5_VLTextForCausalLM
 from src.train.qts_plus_trainer import QTSplusTrainer
 
@@ -25,6 +32,8 @@ torch._dynamo.config.suppress_errors = False
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+from transformers.trainer_utils import get_last_checkpoint
+from transformers.utils import SAFE_WEIGHTS_NAME, WEIGHTS_NAME
 
 # Global acceleration toggles for speed/VRAM
 try:
@@ -113,7 +122,27 @@ class DataArguments:
     train_base_path: str = field(default="", metadata={"help": "Path to image data."})
     val_jsonl_path: str = field(default="", metadata={"help": "Path to caption data."})
     val_base_path: str = field(default="", metadata={"help": "Path to image data."})
-    dataset_type: str = field(default="vscq", metadata={"help": "Type of dataset: choice or qa"})
+    dataset_type: str = field(
+        default="vscq",
+        metadata={
+            "help": (
+                "Type of dataset: vscq (choice), vqa (qa), or llava-video-178k "
+                "(LLaVA-Video-178K JSONL with conversations/video fields)."
+            )
+        },
+    )
+    video_max_frames: int = field(
+        default=40,
+        metadata={"help": "Max frames sampled from a frame-folder/video for Qwen/LLaVA datasets."},
+    )
+    video_min_frames: int = field(
+        default=1,
+        metadata={"help": "Min frames sampled (train only) from a frame-folder/video for Qwen/LLaVA datasets."},
+    )
+    video_sampling: str = field(
+        default="uniform",
+        metadata={"help": "Frame sampling method for frame-folders/videos: uniform|rand."},
+    )
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -165,6 +194,16 @@ class TrainingArguments(transformers.TrainingArguments):
     dataloader_num_workers: int = 2
     report_to: str = "wandb"
     max_grad_norm: float = 1.0
+    # Checkpoint/resume
+    resume_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to a Trainer checkpoint to resume from (e.g. `.../checkpoint-2000`). "
+                "Use `last`/`latest`/`true` to automatically pick the most recent checkpoint in `output_dir`."
+            )
+        },
+    )
 
 def compute_metrics(eval_preds):
     labels_ids = eval_preds.label_ids
@@ -185,6 +224,25 @@ def compute_metrics(eval_preds):
 def preprocess_logits_for_metrics(logits, labels):
     # Move predictions to CPU and detach to avoid GPU accumulation during evaluation
     return torch.argmax(logits, dim=-1).detach().cpu()
+
+def _require_single_token(tokenizer: transformers.PreTrainedTokenizer, token: str, label: str) -> int:
+    """Assert that `token` exists in the tokenizer as a single token and return its id."""
+    try:
+        enc = tokenizer(token, add_special_tokens=False)
+        ids = enc.get("input_ids")
+        if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], list):
+            ids = ids[0]
+        if not isinstance(ids, list) or len(ids) != 1:
+            raise ValueError(f"Tokenize -> {ids}")
+        tid = int(tokenizer.convert_tokens_to_ids(token))
+        unk = getattr(tokenizer, "unk_token_id", None)
+        if unk is not None and tid == int(unk):
+            raise ValueError("token id == unk_token_id")
+        if int(ids[0]) != tid:
+            raise ValueError(f"tokenize id {ids[0]} != convert id {tid}")
+        return tid
+    except Exception as e:
+        raise ValueError(f"{label} must be a single tokenizer token ({token}). Details: {e}") from e
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -242,7 +300,9 @@ def find_all_linear_names(model):
         'vision_tower',    # vision encoder
         'mm_projector',    # multimodal projector / adapters
         'embed_tokens',    # token embedding layer (kept frozen, no LoRA)
+        'tok_embeddings',  # InternLM2 token embedding layer
         'lm_head',         # output head
+        'output',          # InternLM2 output head
         'qts_plus',        # QTS+ specific modules
         'adatok',          # any aux token adapters
     ]
@@ -288,9 +348,56 @@ def main():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Normalize/validate generic video sampling args (used by Qwen/LLaVA datasets).
+    data_args.video_sampling = str(getattr(data_args, "video_sampling", "uniform") or "uniform").lower()
+    if data_args.video_sampling in {"random"}:
+        data_args.video_sampling = "rand"
+    if data_args.video_sampling not in {"uniform", "rand"}:
+        raise ValueError(f"--video_sampling must be one of {{uniform, rand}}, got: {data_args.video_sampling}")
+    if int(getattr(data_args, "video_min_frames", 0)) > int(getattr(data_args, "video_max_frames", 0)):
+        data_args.video_min_frames = int(data_args.video_max_frames)
+
     local_rank = training_args.local_rank
     if local_rank == 0:
         wandb.init(project=model_args.wandb_project_name, name=model_args.wandb_run_name)
+
+    # -------------------------
+    # Resume-from-checkpoint
+    # -------------------------
+    # HF Trainer can restore: model weights, optimizer/scheduler/scaler state, RNG state,
+    # and TrainerState (incl. global_step) when `resume_from_checkpoint` is provided.
+    resume_checkpoint = None
+    # Respect explicit user request first.
+    user_resume = getattr(training_args, "resume_from_checkpoint", None)
+    if isinstance(user_resume, str) and user_resume.strip():
+        user_resume = user_resume.strip()
+        if user_resume.lower() in {"1", "true", "yes", "y", "last", "latest", "auto"}:
+            resume_checkpoint = get_last_checkpoint(training_args.output_dir)
+            if resume_checkpoint is None:
+                raise ValueError(
+                    f"`--resume_from_checkpoint {user_resume}` was set but no checkpoint was found in "
+                    f"`output_dir={training_args.output_dir}`."
+                )
+        else:
+            resume_checkpoint = user_resume
+        if resume_checkpoint is not None and not os.path.isdir(resume_checkpoint):
+            raise ValueError(f"--resume_from_checkpoint must be an existing directory, got: {resume_checkpoint}")
+
+    # If not explicitly set, auto-resume from the latest checkpoint in output_dir when present.
+    if resume_checkpoint is None and not getattr(training_args, "overwrite_output_dir", False):
+        last_checkpoint = get_last_checkpoint(training_args.output_dir) if os.path.isdir(training_args.output_dir) else None
+        if last_checkpoint is not None:
+            resume_checkpoint = last_checkpoint
+            rank0_print(f"Resuming from checkpoint: {resume_checkpoint}")
+        else:
+            # Guard against accidentally overwriting an existing run directory that has no checkpoints.
+            # (Note: we perform this check *before* writing any new metadata files into output_dir.)
+            if os.path.isdir(training_args.output_dir) and len(os.listdir(training_args.output_dir)) > 0:
+                raise ValueError(
+                    f"Output directory ({training_args.output_dir}) already exists and is not empty, "
+                    "but no Trainer checkpoint was found. Use `--overwrite_output_dir` to train from scratch, "
+                    "or set `--resume_from_checkpoint` to a specific checkpoint directory."
+                )
 
     if not os.path.exists(training_args.output_dir) and local_rank == 0:
         os.makedirs(training_args.output_dir, exist_ok=True)
@@ -307,17 +414,83 @@ def main():
     if local_rank == 0:
         rank0_print("="*20 + " Tokenizer preparation " + "="*20)
 
-    # Load tokenizer and processor
-    processor = Qwen2_5_VLVisionProcessor.from_pretrained(model_args.vision_processor)
-    tokenizer = processor.tokenizer
+    lm_type = (model_args.lm_model_type or "").lower()
+    use_llama = "llama_3" in lm_type or "llama3" in lm_type or "llama-3" in lm_type
+    vision_type = (model_args.vision_tower or "").lower() if model_args.vision_tower is not None else ""
 
-    # Ensure special tokens are well-defined and consistent across tokenizer/model
-    # Many decoder-only LMs use EOS as PAD; Qwen configs typically set BOS=PAD=151643 and EOS=151645.
-    # Define a PAD token if missing to avoid HF warnings during training/generation.
-    tokenizer.pad_token = "<|endoftext|>"
-    tokenizer.eos_token = "<|im_end|>"
-    tokenizer.bos_token = "<|endoftext|>"
-    tokenizer.padding_side = "right"
+    # Guard against a common misconfiguration: InternVL vision tower requires InternLM2 LM.
+    if vision_type in {"internvl2_5_vision", "internvl_vision"} and not ("internlm2" in lm_type or "internvl" in lm_type):
+        raise ValueError(
+            "InternVL vision tower requires an InternLM2-based LM wrapper. "
+            "Set `--lm_model_type qts_plus_internlm2_causal_lm` and `--pretrain_lm_model pretrained_models/InternVL2_5-8B-LM`."
+        )
+    if vision_type in {"llava_siglip_vision"} and "qwen2" not in lm_type:
+        raise ValueError(
+            "LLaVA SigLIP vision head requires a Qwen2-based LM wrapper. "
+            "Set `--lm_model_type qts_plus_qwen2_causal_lm` and `--pretrain_lm_model pretrained_models/LLaVA-Video-7B-Qwen2-LM`."
+        )
+
+    # Vision processor + tokenizer selection.
+    if vision_type in {"internvl2_5_vision", "internvl_vision"}:
+        processor = AutoImageProcessor.from_pretrained(model_args.vision_processor, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.pretrain_lm_model,
+            cache_dir=training_args.cache_dir,
+            trust_remote_code=True,
+            fix_mistral_regex=True,
+        )
+        if getattr(tokenizer, "pad_token", None) is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        num_new_tokens = 0
+    elif vision_type in {"llava_siglip_vision"}:
+        processor = LlavaSiglipVisionProcessor.from_pretrained(model_args.vision_processor, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.pretrain_lm_model,
+            cache_dir=training_args.cache_dir,
+            trust_remote_code=True,
+            fix_mistral_regex=True,
+        )
+        if getattr(tokenizer, "pad_token", None) is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        num_new_tokens = 0
+    else:
+        processor = Qwen2_5_VLVisionProcessor.from_pretrained(model_args.vision_processor)
+        if use_llama:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_args.pretrain_lm_model,
+                cache_dir=training_args.cache_dir,
+                fix_mistral_regex=True,
+            )
+            # Llama tokenizers usually have no PAD; use EOS as PAD for batching.
+            if getattr(tokenizer, "pad_token", None) is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.padding_side = "right"
+        else:
+            tokenizer = processor.tokenizer
+            # Ensure special tokens are well-defined and consistent across tokenizer/model
+            tokenizer.pad_token = "<|endoftext|>"
+            tokenizer.eos_token = "<|im_end|>"
+            tokenizer.bos_token = "<|endoftext|>"
+            tokenizer.padding_side = "right"
+
+        # Ensure multimodal placeholder tokens exist as single tokens across tokenizers.
+        # (Embeddings are not used for <|video_pad|> because we splice in vision features.)
+        num_new_tokens = tokenizer.add_special_tokens(
+            {"additional_special_tokens": ["<|image_pad|>", "<|video_pad|>"]}
+        )
+
+    # Validate placeholder tokens are present as single tokens (critical for QTS+ integration).
+    if vision_type in {"internvl2_5_vision", "internvl_vision"}:
+        _require_single_token(tokenizer, "<IMG_CONTEXT>", "InternVL image placeholder token")
+        _require_single_token(tokenizer, "<img>", "InternVL <img> start token")
+        _require_single_token(tokenizer, "</img>", "InternVL </img> end token")
+    elif vision_type in {"llava_siglip_vision"}:
+        _require_single_token(tokenizer, "<image>", "LLaVA <image> placeholder token")
+    else:
+        _require_single_token(tokenizer, "<|video_pad|>", "Qwen video placeholder token")
+        _require_single_token(tokenizer, "<|image_pad|>", "Qwen image placeholder token")
 
     # Convert special tokens to token IDs and set related arguments
     model_args.vocab_size = len(tokenizer)
@@ -340,6 +513,30 @@ def main():
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
             )
+        elif "qts_plus_qwen2_causal_lm" in lm_type:
+            rank0_print("Base model: ", model_args.pretrain_lm_model)
+            model = QTSplusQwen2_ForCausalLM.from_pretrained(
+                model_args.pretrain_lm_model,
+                cache_dir=training_args.cache_dir,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            )
+        elif use_llama:
+            rank0_print("Base model: ", model_args.pretrain_lm_model)
+            model = QTSplusLlama3_ForCausalLM.from_pretrained(
+                model_args.pretrain_lm_model,
+                cache_dir=training_args.cache_dir,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            )
+        elif "internlm2" in lm_type or "internvl" in lm_type:
+            rank0_print("Base model: ", model_args.pretrain_lm_model)
+            model = QTSplusInternLM2_ForCausalLM.from_pretrained(
+                model_args.pretrain_lm_model,
+                cache_dir=training_args.cache_dir,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            )
         else:
             raise ValueError(f"Unknown Model Type {model_args.lm_model_type}")
     else:
@@ -356,13 +553,25 @@ def main():
     except Exception:
         pass
 
+    # Resize token embeddings if we added special tokens to the tokenizer.
+    try:
+        if isinstance(num_new_tokens, int) and num_new_tokens > 0:
+            model.resize_token_embeddings(len(tokenizer))
+            # Keep dtype consistent after resize (new rows may be fp32).
+            try:
+                model.to(dtype=torch.bfloat16)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     model.config.use_cache = False
 
     # Align model config and generation config to tokenizer to silence PAD/BOS/EOS mismatch warnings
     try:
-        pad_id = getattr(tokenizer, "pad_token_id", 151643)
-        bos_id = getattr(tokenizer, "bos_token_id", 151643)
-        eos_id = getattr(tokenizer, "eos_token_id", 151645)
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        bos_id = getattr(tokenizer, "bos_token_id", None)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
         if pad_id is not None:
             model.config.pad_token_id = pad_id
         if bos_id is not None:
@@ -379,14 +588,30 @@ def main():
     except Exception as e:
         rank0_print(f"[warn] Unable to align model/generation config with tokenizer: {e}")
 
+    # Persist placeholder token ids into the model config so QTS+ can locate them.
+    try:
+        if vision_type in {"internvl2_5_vision", "internvl_vision"}:
+            model.config.image_token_id = tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+        elif vision_type in {"llava_siglip_vision"}:
+            model.config.image_token_id = tokenizer.convert_tokens_to_ids("<image>")
+        else:
+            model.config.video_token_id = tokenizer.convert_tokens_to_ids("<|video_pad|>")
+            model.config.image_token_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    except Exception:
+        pass
+
     if model_args.freeze_lm:
-        model.model.requires_grad_(False)
+        # Freeze only the LM weights; keep vision / mm_projector / QTS+ trainable.
+        for name, p in model.named_parameters():
+            if any(k in name for k in ("vision_tower", "mm_projector", "qts_plus")):
+                continue
+            p.requires_grad = False
 
     model.enable_input_require_grads()
     # Prefer SDPA attention implementation for speed + memory efficiency
     try:
         if hasattr(model, "config") and hasattr(model.config, "_attn_implementation"):
-            model.config._attn_implementation = "sdpa"
+            model.config._attn_implementation = "flash_attention_2"
     except Exception:
         pass
 
@@ -404,7 +629,7 @@ def main():
         try:
             vt = model.get_vision_tower()
             if hasattr(vt, "config") and hasattr(vt.config, "_attn_implementation"):
-                vt.config._attn_implementation = "sdpa"
+                vt.config._attn_implementation = "flash_attention_2"
             # Ensure vision tower uses bf16 and gradient checkpointing when requested
             try:
                 vt.to(dtype=torch.bfloat16)
@@ -486,6 +711,11 @@ def main():
     rank0_print("Model max length: ", data_args.max_length)
     rank0_print("Batch size: ", training_args.per_device_train_batch_size)
     max_length=data_args.max_length
+    prompt_style = (
+        "llava_qwen2"
+        if vision_type in {"llava_siglip_vision"}
+        else ("llama3" if use_llama else ("internvl2_5" if vision_type in {"internvl2_5_vision", "internvl_vision"} else "qwen2_5_vl"))
+    )
     if model_args.vision_tower == "qwen2_5_vl_vision":
         if data_args.dataset_type == "vscq":
             from src.dataset.sharegptvideo_choice_dataset import ShareGPTVideoChoiceDataset
@@ -493,36 +723,200 @@ def main():
                 base_path=data_args.train_base_path,
                 jsonl_path=data_args.train_jsonl_path,
                 processor=processor,
+                tokenizer=tokenizer,
+                prompt_style=prompt_style,
                 max_length=max_length,
                 local_rank=local_rank,
                 train=True,
+                question_instruction="Please provide your options (only A or B or C or D) directly. Do not give any other responses.",
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
             )
             eval_dataset = ShareGPTVideoChoiceDataset(
                 base_path=data_args.val_base_path,
                 jsonl_path=data_args.val_jsonl_path,
                 processor=processor,
+                tokenizer=tokenizer,
+                prompt_style=prompt_style,
                 max_length=max_length,
                 local_rank=local_rank,
                 train=False,
-                question_instruction="Please provide your options and provide additional details.",
+                question_instruction="Please give your answer and provide your reasoning process.",
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
             )
-        elif data_args.dataset_type == "vqa":
-            from src.dataset.sharegptvideo_qa_dataset import ShareGPTVideoQADataset
-            train_dataset = ShareGPTVideoQADataset(
+        elif data_args.dataset_type in {"vqa", "llava-video-178k", "llava_video_178k"}:
+            if data_args.dataset_type in {"llava-video-178k", "llava_video_178k"}:
+                from src.dataset.llava_video_178k_qa_dataset import LlavaVideo178KQADataset as _QADataset
+            else:
+                from src.dataset.sharegptvideo_qa_dataset import ShareGPTVideoQADataset as _QADataset
+
+            train_dataset = _QADataset(
                 base_path=data_args.train_base_path,
                 jsonl_path=data_args.train_jsonl_path,
                 processor=processor,
+                tokenizer=tokenizer,
+                prompt_style=prompt_style,
                 max_length=max_length,
                 local_rank=local_rank,
                 train=True,
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
             )
-            eval_dataset = ShareGPTVideoQADataset(
+            eval_dataset = _QADataset(
                 base_path=data_args.val_base_path,
                 jsonl_path=data_args.val_jsonl_path,
                 processor=processor,
+                tokenizer=tokenizer,
+                prompt_style=prompt_style,
                 max_length=max_length,
                 local_rank=local_rank,
                 train=False,
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
+            )
+        else:
+            raise ValueError(f"Unknown dataset type {data_args.dataset_type}")
+        rank0_print("Dataset type: ", data_args.dataset_type)
+    elif model_args.vision_tower in {"internvl2_5_vision", "internvl_vision"}:
+        # InternVL datasets use `<IMG_CONTEXT>` placeholders and an image processor.
+        vcfg_path = model_args.pretrain_vision_model or model_args.vision_processor
+        if data_args.dataset_type == "vqa":
+            from src.dataset.sharegptvideo_qa_internvl_dataset import ShareGPTVideoQAInternVLDataset as _Dataset
+
+            train_dataset = _Dataset(
+                base_path=data_args.train_base_path,
+                jsonl_path=data_args.train_jsonl_path,
+                image_processor=processor,
+                tokenizer=tokenizer,
+                vision_config_path=vcfg_path,
+                max_length=max_length,
+                local_rank=local_rank,
+                train=True,
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
+            )
+            eval_dataset = _Dataset(
+                base_path=data_args.val_base_path,
+                jsonl_path=data_args.val_jsonl_path,
+                image_processor=processor,
+                tokenizer=tokenizer,
+                vision_config_path=vcfg_path,
+                max_length=max_length,
+                local_rank=local_rank,
+                train=False,
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling="middle",
+            )
+        elif data_args.dataset_type == "vscq":
+            from src.dataset.sharegptvideo_choice_internvl_dataset import (
+                ShareGPTVideoChoiceInternVLDataset as _Dataset,
+            )
+
+            train_dataset = _Dataset(
+                base_path=data_args.train_base_path,
+                jsonl_path=data_args.train_jsonl_path,
+                image_processor=processor,
+                tokenizer=tokenizer,
+                vision_config_path=vcfg_path,
+                max_length=max_length,
+                local_rank=local_rank,
+                train=True,
+                question_instruction="Please provide your options (only A or B or C or D) directly. Do not give any other responses.",
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
+            )
+            eval_dataset = _Dataset(
+                base_path=data_args.val_base_path,
+                jsonl_path=data_args.val_jsonl_path,
+                image_processor=processor,
+                tokenizer=tokenizer,
+                vision_config_path=vcfg_path,
+                max_length=max_length,
+                local_rank=local_rank,
+                train=False,
+                question_instruction="Please give your answer and provide your reasoning process.",
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling="middle",
+            )
+        else:
+            raise ValueError(
+                "InternVL vision tower currently supports dataset_type in {'vqa', 'vscq'} only, "
+                f"got: {data_args.dataset_type}"
+            )
+        rank0_print("Dataset type: ", data_args.dataset_type)
+    elif model_args.vision_tower in {"llava_siglip_vision"}:
+        # LLaVA SigLIP vision head reuses the Qwen-style datasets (vision_input contains `pixel_values`).
+        if data_args.dataset_type == "vscq":
+            from src.dataset.sharegptvideo_choice_dataset import ShareGPTVideoChoiceDataset as _Dataset
+
+            train_dataset = _Dataset(
+                base_path=data_args.train_base_path,
+                jsonl_path=data_args.train_jsonl_path,
+                processor=processor,
+                tokenizer=tokenizer,
+                prompt_style=prompt_style,
+                max_length=max_length,
+                local_rank=local_rank,
+                train=True,
+                question_instruction="Please provide your options (only A or B or C or D) directly. Do not give any other responses.",
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
+            )
+            eval_dataset = _Dataset(
+                base_path=data_args.val_base_path,
+                jsonl_path=data_args.val_jsonl_path,
+                processor=processor,
+                tokenizer=tokenizer,
+                prompt_style=prompt_style,
+                max_length=max_length,
+                local_rank=local_rank,
+                train=False,
+                question_instruction="Please give your answer and provide your reasoning process.",
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
+            )
+        elif data_args.dataset_type in {"vqa", "llava-video-178k", "llava_video_178k"}:
+            if data_args.dataset_type in {"llava-video-178k", "llava_video_178k"}:
+                from src.dataset.llava_video_178k_qa_dataset import LlavaVideo178KQADataset as _QADataset
+            else:
+                from src.dataset.sharegptvideo_qa_dataset import ShareGPTVideoQADataset as _QADataset
+
+            train_dataset = _QADataset(
+                base_path=data_args.train_base_path,
+                jsonl_path=data_args.train_jsonl_path,
+                processor=processor,
+                tokenizer=tokenizer,
+                prompt_style=prompt_style,
+                max_length=max_length,
+                local_rank=local_rank,
+                train=True,
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
+            )
+            eval_dataset = _QADataset(
+                base_path=data_args.val_base_path,
+                jsonl_path=data_args.val_jsonl_path,
+                processor=processor,
+                tokenizer=tokenizer,
+                prompt_style=prompt_style,
+                max_length=max_length,
+                local_rank=local_rank,
+                train=False,
+                video_max_frames=data_args.video_max_frames,
+                video_min_frames=data_args.video_min_frames,
+                video_sampling=data_args.video_sampling,
             )
         else:
             raise ValueError(f"Unknown dataset type {data_args.dataset_type}")
@@ -530,6 +924,37 @@ def main():
     else:
         raise ValueError(f"Unknown vision tower {model_args.vision_tower}")
     data_collator = DataCollator()
+
+    # -------------------------
+    # Token/label sanity checks
+    # -------------------------
+    # Keep this lightweight: only check one sample and only on rank0.
+    if local_rank in (0, -1, None):
+        try:
+            # InternVL training critically depends on `<IMG_CONTEXT>` being present
+            # in the tokenized prompt and being masked in labels.
+            if vision_type in {"internvl2_5_vision", "internvl_vision"}:
+                sample = None
+                for i in range(min(64, len(train_dataset))):
+                    s = train_dataset[i]
+                    if s is not None and isinstance(s, dict) and "input_ids" in s:
+                        sample = s
+                        break
+                if sample is not None:
+                    ids = sample["input_ids"]
+                    labs = sample.get("labels", None)
+                    ctx_id = int(getattr(model.config, "image_token_id", -1))
+                    if ctx_id < 0:
+                        raise ValueError("model.config.image_token_id is not set for InternVL.")
+                    n_ctx = int((ids == ctx_id).sum().item()) if torch.is_tensor(ids) else 0
+                    if n_ctx <= 0:
+                        raise ValueError("No `<IMG_CONTEXT>` tokens found in a tokenized dataset sample.")
+                    if torch.is_tensor(labs):
+                        ok = bool((labs[ids == ctx_id] == -100).all().item())
+                        if not ok:
+                            raise ValueError("Labels are not masked (-100) at `<IMG_CONTEXT>` positions.")
+        except Exception as e:
+            raise RuntimeError(f"Tokenizer/dataset sanity check failed: {e}") from e
     
     rank0_print("="*20 + " Training " + "="*20)
 
@@ -552,11 +977,12 @@ def main():
                       )
     # Attach full processor for saving/decoding convenience
     try:
-        trainer.processing_class = processor
+        # Use vision processor only when it shares the same tokenizer; otherwise prefer the LM tokenizer for decoding.
+        trainer.processing_class = processor if getattr(processor, "tokenizer", None) is tokenizer else tokenizer
     except Exception:
         pass
     
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_state()
     model.config.use_cache = True
 

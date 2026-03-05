@@ -44,10 +44,19 @@ class QTSplusTrainer(Trainer):
         super().__init__(*args, **kwargs)
         # Override signature columns to match our dataset output
         self._signature_columns = ["input_ids", "attention_mask", "labels", "vision_input"]
+        # HF Trainer may infer `model_accepts_loss_kwargs=True` when the model forward has `**kwargs`.
+        # Our QTS+ model wrappers currently do not use `num_items_in_batch` to rescale the loss, so
+        # keep the legacy behavior (Trainer divides by grad-accumulation steps).
+        self.model_accepts_loss_kwargs = False
         # Cache for a single eval example used for quick qualitative checks
         self._eval_example_cache: Optional[Dict[str, Any]] = None
         # Cache for tokenizer/processor resolution
         self._proc_for_decode = None
+        # Track and guard against pathological dataloaders that yield empty batches (e.g., all-None items filtered out)
+        self._empty_train_batches_total = 0
+        self._empty_train_batches_consecutive = 0
+        self._empty_eval_batches_total = 0
+        self._empty_eval_batches_consecutive = 0
 
     def _get_tokenizer_like(self):
         """Return an object with `decode`, `pad_token_id`, `eos_token_id`.
@@ -71,7 +80,7 @@ class QTSplusTrainer(Trainer):
         return cand
 
     def training_step(
-        self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None
+        self, model: nn.Module, inputs: Optional[dict[str, Union[torch.Tensor, Any]]], num_items_in_batch=None
     ) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -94,6 +103,28 @@ class QTSplusTrainer(Trainer):
         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
             self.optimizer.train()
 
+        if not inputs:
+            # Some datasets intentionally return None for samples with missing vision files/frames and our
+            # collator filters those out. With batch_size=1, that can yield an empty batch.
+            self._empty_train_batches_total += 1
+            self._empty_train_batches_consecutive += 1
+            if self._empty_train_batches_consecutive == 1:
+                logger.warning(
+                    "Empty training batch received (all samples in this batch were filtered out). "
+                    "This usually means some dataset items returned None (e.g., missing/empty vision frames). "
+                    "Skipping this step."
+                )
+            # If this happens continuously, it's almost certainly a misconfigured dataset path/mount.
+            if self._empty_train_batches_consecutive >= 100:
+                raise RuntimeError(
+                    "Received 100 consecutive empty training batches. "
+                    "Verify your dataset paths and that vision files/frames exist on *every* rank: "
+                    "`--train_base_path`, `--train_jsonl_path`, and that `train_base_path/<vision_id>/` "
+                    "contains image frames."
+                )
+            return torch.zeros((), device=self.args.device)
+
+        self._empty_train_batches_consecutive = 0
         inputs = self._prepare_inputs(inputs)
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
@@ -154,6 +185,34 @@ class QTSplusTrainer(Trainer):
             self.accelerator.backward(loss, **kwargs)
 
             return loss.detach()
+
+    def prediction_step(
+        self,
+        model: nn.Module,
+        inputs: Optional[dict[str, Union[torch.Tensor, Any]]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[list[str]] = None,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        # Mirror the empty-batch guard in training_step for eval/predict.
+        if not inputs:
+            self._empty_eval_batches_total += 1
+            self._empty_eval_batches_consecutive += 1
+            if self._empty_eval_batches_consecutive == 1:
+                logger.warning(
+                    "Empty eval batch received (all samples in this batch were filtered out). "
+                    "This usually means some dataset items returned None (e.g., missing/empty vision frames). "
+                    "Skipping this batch."
+                )
+            if self._empty_eval_batches_consecutive >= 100:
+                raise RuntimeError(
+                    "Received 100 consecutive empty eval batches. "
+                    "Verify `--val_base_path`, `--val_jsonl_path`, and that `val_base_path/<vision_id>/` "
+                    "contains image frames."
+                )
+            return None, None, None
+
+        self._empty_eval_batches_consecutive = 0
+        return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
         
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -294,6 +353,21 @@ class QTSplusTrainer(Trainer):
         vision_input = sample.get("vision_input", None)
         if isinstance(vision_input, dict):
             vision_input = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in vision_input.items()}
+        elif torch.is_tensor(vision_input):
+            vision_input = vision_input.to(device)
+
+        # Ensure vision inputs match model compute dtype for bf16/fp16 runs.
+        try:
+            model_dtype = next(model.parameters()).dtype
+        except Exception:
+            model_dtype = None
+        if model_dtype is not None:
+            if isinstance(vision_input, dict):
+                for k, v in list(vision_input.items()):
+                    if torch.is_tensor(v) and v.is_floating_point():
+                        vision_input[k] = v.to(dtype=model_dtype)
+            elif torch.is_tensor(vision_input) and vision_input.is_floating_point():
+                vision_input = vision_input.to(dtype=model_dtype)
 
         # Derive prompt (question-only) prefix length
         # Use the first index where labels != -100 within valid attention as the
@@ -318,18 +392,23 @@ class QTSplusTrainer(Trainer):
         pad_id = getattr(tok, "pad_token_id", None) or getattr(tok, "eos_token_id", None) or 0
         eos_id = getattr(tok, "eos_token_id", None)
         bos_id = getattr(tok, "bos_token_id", None)
-        gen_ids = model.generate(
-            vision_input=vision_input,
-            input_ids=prompt_ids,
-            question_input_ids=q_ids_raw,
-            attention_mask=prompt_attention_mask,
-            max_new_tokens=128,
-            do_sample=False,
-            num_beams=1,
-            pad_token_id=pad_id,
-            eos_token_id=eos_id,
-            bos_token_id=bos_id,
-        )
+        device_type = device.type
+        use_autocast = device_type == "cuda" and (getattr(self.args, "bf16", False) or getattr(self.args, "fp16", False))
+        ac_dtype = torch.bfloat16 if getattr(self.args, "bf16", False) else torch.float16
+        with torch.autocast(device_type=device_type, dtype=ac_dtype, enabled=use_autocast):
+            # ignore special tokens in generation
+            gen_ids = model.generate(
+                vision_input=vision_input,
+                input_ids=prompt_ids,
+                question_input_ids=q_ids_raw,
+                attention_mask=prompt_attention_mask,
+                max_new_tokens=128,
+                do_sample=False,
+                num_beams=1,
+                pad_token_id=pad_id,
+                eos_token_id=eos_id,
+                bos_token_id=bos_id,
+            )
 
         # Trim generated to the completion portion (generate() prepends prompt)
         comp_ids = gen_ids[:, prompt_ids.shape[1]:]
@@ -341,10 +420,11 @@ class QTSplusTrainer(Trainer):
             if model_was_training:
                 model.train()
             return
-        q_text = tok.decode(prompt_ids[0], skip_special_tokens=False)
-        pred_text = tok.decode(comp_ids[0], skip_special_tokens=False)
-        gt_text = tok.decode(gt_ids[0], skip_special_tokens=False)
-
+        # Don't print special tokens in qualitative examples (e.g. <|im_start|>, <img>, <IMG_CONTEXT>, <s>).
+        q_text = tok.decode(prompt_ids[0], skip_special_tokens=True)
+        pred_text = tok.decode(comp_ids[0], skip_special_tokens=True)
+        gt_text = tok.decode(gt_ids[0], skip_special_tokens=True)
+        
         print("="*20 +"Example" + "="*20)
         print(f"[*]Q:  \t{q_text}")
         print(f"[*]Pred: \t{pred_text}")

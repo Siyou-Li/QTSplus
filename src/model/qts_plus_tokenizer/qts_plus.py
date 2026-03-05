@@ -29,6 +29,22 @@ class RMSNorm(nn.Module):
         return self.weight * x
 
 
+class RMSNormFp32(nn.Module):
+    """RMSNorm that computes statistics in fp32 for stability (common in modern LMs)."""
+
+    def __init__(self, d: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x_fp32 = x.to(torch.float32)
+        var = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x_fp32 * torch.rsqrt(var + self.eps)
+        return (self.weight * x_norm).to(dtype)
+
+
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.0):
         super().__init__()
@@ -98,19 +114,15 @@ class ScoringCrossAttentionLayer(nn.Module):
         q = q + self.ffn(h)
         return q, attn
 
-class Qwen2_5_ScoringCrossAttentionLayer(nn.Module):
+class LMScoringCrossAttentionLayer(nn.Module):
     """
-    Cross-attention block compatible with Qwen2.5 attention parameterization.
-    - Separate q/k/v projections (with optional multi-query kv heads)
-    - Optional reuse of weights from Qwen2.5-VL-3B-Instruct-LM layers
-    - Pre/post RMSNorm + simple FFN on the query path
+    Cross-attention block that can be initialized from a downstream decoder LM layer.
+    - Separate q/k/v projections with optional GQA/MQA (num_key_value_heads).
+    - Rotary embeddings are intentionally NOT applied (kv come from vision features).
+    - Pre/post RMSNorm + simple FFN on the query path.
 
     Notes:
-    - Rotary embeddings are intentionally not applied here since kv come from
-      vision features with their own positional scheme; we only reuse the
-      projection weights and output projection.
-    - If num_key_value_heads < num_heads, k/v heads are repeated to match num_heads
-      as in Qwen2.5 attention.
+    - If num_key_value_heads < num_heads, k/v heads are repeated to match num_heads.
     """
     def __init__(
         self,
@@ -120,7 +132,6 @@ class Qwen2_5_ScoringCrossAttentionLayer(nn.Module):
         dropout: float = 0.0,
         d_ff: Optional[int] = None,
         rms_norm_eps: float = 1e-6,
-        use_qwen_rms: bool = True,
     ):
         super().__init__()
         assert d_model % num_heads == 0, "hidden size must be divisible by num_heads"
@@ -131,31 +142,12 @@ class Qwen2_5_ScoringCrossAttentionLayer(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.attention_dropout = dropout
 
-        # Norms
-        if use_qwen_rms:
-            # Local minimal RMSNorm following Qwen2RMSNorm behavior
-            class _Qwen2RMSNorm(nn.Module):
-                def __init__(self, hidden_size: int, eps: float = 1e-6):
-                    super().__init__()
-                    self.weight = nn.Parameter(torch.ones(hidden_size))
-                    self.eps = eps
+        # Norms (fp32 stats for stability; common across modern decoder LMs)
+        self.q_norm = RMSNormFp32(d_model, eps=rms_norm_eps)
+        self.kv_norm = RMSNormFp32(d_model, eps=rms_norm_eps)
+        self.ffn_norm = RMSNormFp32(d_model, eps=rms_norm_eps)
 
-                def forward(self, x: torch.Tensor) -> torch.Tensor:
-                    dtype = x.dtype
-                    x = x.to(torch.float32)
-                    var = x.pow(2).mean(dim=-1, keepdim=True)
-                    x = x * torch.rsqrt(var + self.eps)
-                    return (self.weight * x).to(dtype)
-
-            self.q_norm = _Qwen2RMSNorm(d_model, eps=rms_norm_eps)
-            self.kv_norm = _Qwen2RMSNorm(d_model, eps=rms_norm_eps)
-            self.ffn_norm = _Qwen2RMSNorm(d_model, eps=rms_norm_eps)
-        else:
-            self.q_norm = RMSNorm(d_model, eps=rms_norm_eps)
-            self.kv_norm = RMSNorm(d_model, eps=rms_norm_eps)
-            self.ffn_norm = RMSNorm(d_model, eps=rms_norm_eps)
-
-        # Qwen-style projections
+        # LM-style projections (q/k/v may be GQA/MQA with fewer kv heads)
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
@@ -226,53 +218,92 @@ class Qwen2_5_ScoringCrossAttentionLayer(nn.Module):
 
         return q, (attn_weights if need_weights else None)
 
-    def init_from_qwen_attn(self, qwen_attn: nn.Module, qwen_input_ln: Optional[nn.Module] = None):
+    def init_from_lm_attn(
+        self,
+        lm_attn: nn.Module,
+        lm_input_norm: Optional[nn.Module] = None,
+        lm_post_attn_norm: Optional[nn.Module] = None,
+    ) -> None:
+        """Best-effort init from a downstream LM attention module + norms.
+
+        Supported projection patterns:
+        - Separate projections: `q_proj`, `k_proj`, `v_proj`, and (`o_proj` or `out_proj`).
+        - Fused QKV: (`query_key_value` or `c_attn`) where weights/biases are split into q/k/v.
         """
-        Initialize projections from a Qwen2.5 attention module.
-        Expects attributes: q_proj, k_proj, v_proj, o_proj.
-        Optionally copy RMSNorm weight from the corresponding input_layernorm.
-        """
-        def _copy_param(dst: torch.nn.Parameter, src: torch.nn.Parameter, name: str):
+
+        def _copy_param(dst: torch.nn.Parameter, src: torch.Tensor, name: str) -> bool:
             if dst.shape != src.shape:
-                print(f"[QTS+] Skip copy for {name}: shape mismatch {tuple(src.shape)} -> {tuple(dst.shape)}")
+                print(f"[QTS+] Skip init for {name}: shape mismatch {tuple(src.shape)} -> {tuple(dst.shape)}")
                 return False
             dst.copy_(src)
             return True
 
-        # Copy weights without tracking gradients to avoid in-place leaf autograd errors
+        def _maybe_copy_linear(dst: nn.Linear, src_w: torch.Tensor, src_b: Optional[torch.Tensor], prefix: str) -> None:
+            _copy_param(dst.weight, src_w, f"{prefix}.weight")
+            if dst.bias is None:
+                return
+            if src_b is None:
+                dst.bias.zero_()
+                return
+            _copy_param(dst.bias, src_b, f"{prefix}.bias")
+
         with torch.no_grad():
-            ok = True
-            ok &= _copy_param(self.q_proj.weight, qwen_attn.q_proj.weight, "q_proj.weight")
-            if self.q_proj.bias is not None and getattr(qwen_attn.q_proj, 'bias', None) is not None:
-                ok &= _copy_param(self.q_proj.bias, qwen_attn.q_proj.bias, "q_proj.bias")
+            # 1) Projections
+            if all(hasattr(lm_attn, n) for n in ("q_proj", "k_proj", "v_proj")):
+                q_src = lm_attn.q_proj
+                k_src = lm_attn.k_proj
+                v_src = lm_attn.v_proj
+                o_src = getattr(lm_attn, "o_proj", None) or getattr(lm_attn, "out_proj", None)
+                if o_src is None:
+                    o_src = getattr(lm_attn, "c_proj", None)
+                if q_src is not None:
+                    _maybe_copy_linear(self.q_proj, q_src.weight, getattr(q_src, "bias", None), "q_proj")
+                if k_src is not None:
+                    _maybe_copy_linear(self.k_proj, k_src.weight, getattr(k_src, "bias", None), "k_proj")
+                if v_src is not None:
+                    _maybe_copy_linear(self.v_proj, v_src.weight, getattr(v_src, "bias", None), "v_proj")
+                if o_src is not None and hasattr(o_src, "weight"):
+                    _copy_param(self.o_proj.weight, o_src.weight, "o_proj.weight")
+            else:
+                # Fused QKV weights common in some HF models (e.g., GPT-NeoX, GPT-2 style)
+                fused = getattr(lm_attn, "query_key_value", None) or getattr(lm_attn, "c_attn", None)
+                out = getattr(lm_attn, "o_proj", None) or getattr(lm_attn, "out_proj", None) or getattr(lm_attn, "c_proj", None)
+                if fused is not None and hasattr(fused, "weight"):
+                    w = fused.weight
+                    b = getattr(fused, "bias", None)
+                    # Handle both (3D, D) and (D, 3D) conventions
+                    if w.shape[0] == 3 * self.hidden_size and w.shape[1] == self.hidden_size:
+                        qw, kw, vw = w.split(self.hidden_size, dim=0)
+                        qb, kb, vb = (b.split(self.hidden_size, dim=0) if b is not None and b.numel() == 3 * self.hidden_size else (None, None, None))
+                    elif w.shape[0] == self.hidden_size and w.shape[1] == 3 * self.hidden_size:
+                        qw, kw, vw = w.split(self.hidden_size, dim=1)
+                        qw, kw, vw = qw.t(), kw.t(), vw.t()
+                        qb, kb, vb = (b.split(self.hidden_size, dim=0) if b is not None and b.numel() == 3 * self.hidden_size else (None, None, None))
+                    else:
+                        qw = kw = vw = qb = kb = vb = None
 
-            ok &= _copy_param(self.k_proj.weight, qwen_attn.k_proj.weight, "k_proj.weight")
-            if self.k_proj.bias is not None and getattr(qwen_attn.k_proj, 'bias', None) is not None:
-                ok &= _copy_param(self.k_proj.bias, qwen_attn.k_proj.bias, "k_proj.bias")
+                    if qw is not None:
+                        _maybe_copy_linear(self.q_proj, qw, qb, "q_proj")
+                        _maybe_copy_linear(self.k_proj, kw, kb, "k_proj")
+                        _maybe_copy_linear(self.v_proj, vw, vb, "v_proj")
+                    if out is not None and hasattr(out, "weight"):
+                        _copy_param(self.o_proj.weight, out.weight, "o_proj.weight")
 
-            ok &= _copy_param(self.v_proj.weight, qwen_attn.v_proj.weight, "v_proj.weight")
-            if self.v_proj.bias is not None and getattr(qwen_attn.v_proj, 'bias', None) is not None:
-                ok &= _copy_param(self.v_proj.bias, qwen_attn.v_proj.bias, "v_proj.bias")
+            # 2) Norms
+            if lm_input_norm is not None and hasattr(lm_input_norm, "weight"):
+                _copy_param(self.q_norm.weight, lm_input_norm.weight, "q_norm.weight")
+                _copy_param(self.kv_norm.weight, lm_input_norm.weight, "kv_norm.weight")
+            if lm_post_attn_norm is not None and hasattr(lm_post_attn_norm, "weight"):
+                _copy_param(self.ffn_norm.weight, lm_post_attn_norm.weight, "ffn_norm.weight")
+            elif lm_input_norm is not None and hasattr(lm_input_norm, "weight"):
+                _copy_param(self.ffn_norm.weight, lm_input_norm.weight, "ffn_norm.weight")
 
-            ok &= _copy_param(self.o_proj.weight, qwen_attn.o_proj.weight, "o_proj.weight")
+        print("[QTS+] Scoring layer initialized from downstream LM weights (best-effort).")
 
-            # Copy RMSNorm weights if compatible
-            if qwen_input_ln is not None and hasattr(qwen_input_ln, 'weight'):
-                if hasattr(self.q_norm, 'weight'):
-                    _copy_param(self.q_norm.weight, qwen_input_ln.weight, "q_norm.weight")
-                if hasattr(self.kv_norm, 'weight'):
-                    _copy_param(self.kv_norm.weight, qwen_input_ln.weight, "kv_norm.weight")
-
-        print("Qwen2.5 attention weights initialized (best-effort shape check).")
-
-
-class Qwen2_5_SelfReencodeLayer(nn.Module):
+class LMSelfReencodeLayer(nn.Module):
     """
-    Thin wrapper that reuses Qwen2_5_ScoringCrossAttentionLayer as a self-attention
-    re-encoding block (q == kv). This avoids duplicating attention code while enabling
-    initialization from Qwen2.5 LM layers.
-
-    Forward signature matches TinyTransformerBlock(x[, key_padding_mask]).
+    Thin wrapper that reuses LMScoringCrossAttentionLayer as a self-attention
+    re-encoding block (q == kv).
     """
     def __init__(
         self,
@@ -282,25 +313,28 @@ class Qwen2_5_SelfReencodeLayer(nn.Module):
         dropout: float = 0.0,
         d_ff: Optional[int] = None,
         rms_norm_eps: float = 1e-6,
-        use_qwen_rms: bool = True,
     ):
         super().__init__()
-        self.core = Qwen2_5_ScoringCrossAttentionLayer(
+        self.core = LMScoringCrossAttentionLayer(
             d_model=d_model,
             num_heads=num_heads,
             num_key_value_heads=num_key_value_heads or num_heads,
             dropout=dropout,
             d_ff=d_ff,
             rms_norm_eps=rms_norm_eps,
-            use_qwen_rms=use_qwen_rms,
         )
 
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         y, _ = self.core(x, x, kv_key_padding_mask=key_padding_mask, need_weights=False)
         return y
 
-    def init_from_qwen_attn(self, qwen_attn: nn.Module, qwen_input_ln: Optional[nn.Module] = None):
-        self.core.init_from_qwen_attn(qwen_attn, qwen_input_ln)
+    def init_from_lm_attn(
+        self,
+        lm_attn: nn.Module,
+        lm_input_norm: Optional[nn.Module] = None,
+        lm_post_attn_norm: Optional[nn.Module] = None,
+    ) -> None:
+        self.core.init_from_lm_attn(lm_attn, lm_input_norm=lm_input_norm, lm_post_attn_norm=lm_post_attn_norm)
 
 # QTS+ 
 class BudgetHead(nn.Module):
@@ -368,32 +402,30 @@ class QTSplus(nn.Module):
         # self.Wk = nn.Linear(d_model, d_model, bias=False)
         # self.Wq = nn.Linear(d_model, d_model, bias=False)
 
-        # scoring layers: Qwen2.5-compatible by default
+        # scoring layers: initialized from downstream LM when available
         n_heads_eff = self.n_heads
         n_kv_heads_eff = int(n_kv_heads) if (n_kv_heads is not None and int(n_kv_heads) > 0) else self.n_heads
         self.scoring_layers = nn.ModuleList([
-            Qwen2_5_ScoringCrossAttentionLayer(
+            LMScoringCrossAttentionLayer(
                 d_model,
                 num_heads=n_heads_eff,
                 num_key_value_heads=n_kv_heads_eff,
                 dropout=0.0,
                 rms_norm_eps=1e-6,
-                use_qwen_rms=True,
             ) for _ in range(self.n_scoring_layers)
         ])
         
         self.budget = BudgetHead(d_model, rho_min=rho_min, rho_max=rho_max)
 
-        # re-encode layers: Qwen-style self-attention by default when enabled
+        # re-encode layers: self-attention blocks that can be initialized from downstream LM
         if use_reencode:
             self.reencode_layers = nn.ModuleList([
-                Qwen2_5_SelfReencodeLayer(
+                LMSelfReencodeLayer(
                     d_model,
                     num_heads=self.n_heads,
                     num_key_value_heads=n_kv_heads_eff,
                     dropout=block_dropout,
                     rms_norm_eps=1e-6,
-                    use_qwen_rms=True,
                 ) for _ in range(self.n_reencode_layers)
             ])
         else:
@@ -598,17 +630,66 @@ class QTSplus(nn.Module):
                 "n": n,
             }
 
-    # --- Utilities to initialize Qwen-scoring directly from a loaded LM ---
-    def init_qwen_scoring_from_lm_model(self, lm_model: nn.Module, layer_indices: list, rms_norm_eps: Optional[float] = None):
-        """
-        Initialize scoring layers from a loaded Qwen2.5 text model instance, avoiding the need
-        for explicit qts_plus_qwen_* configuration beyond the layer indices.
+    # --- Utilities to initialize scoring/re-encode layers from a downstream LM ---
+    @staticmethod
+    def _collect_lm_decoder_layers(lm_model: nn.Module) -> list[nn.Module]:
+        """Best-effort extraction of decoder layers across common HF model layouts."""
+        candidates = [
+            ("layers",),
+            ("model", "layers"),
+            ("model", "model", "layers"),
+            ("transformer", "h"),
+            ("gpt_neox", "layers"),
+            ("decoder", "layers"),
+            ("model", "decoder", "layers"),
+        ]
+        for chain in candidates:
+            cur = lm_model
+            ok = True
+            for attr in chain:
+                if not hasattr(cur, attr):
+                    ok = False
+                    break
+                cur = getattr(cur, attr)
+            if ok and isinstance(cur, (nn.ModuleList, list, tuple)):
+                return list(cur)
 
-        lm_model: a Qwen2_5_VLTextModel-compatible module with attributes:
-          - config.hidden_size, config.num_attention_heads, config.num_key_value_heads
-          - layers: iterable of decoder layers with .self_attn and .input_layernorm
-        layer_indices: list[int] mapping QTS+ scoring layers to LM layers to copy from.
-        """
+        # Fallback: scan for the first ModuleList whose *final* component is `layers` or `h`.
+        for name, mod in lm_model.named_modules():
+            if not isinstance(mod, nn.ModuleList):
+                continue
+            last = name.split(".")[-1]
+            if last in {"layers", "h"}:
+                return list(mod)
+        return []
+
+    @staticmethod
+    def _extract_lm_layer_components(
+        lm_layer: nn.Module,
+    ) -> tuple[Optional[nn.Module], Optional[nn.Module], Optional[nn.Module]]:
+        """Return (attn, input_norm, post_attn_norm) for a decoder layer, best-effort."""
+        attn = None
+        for n in ("self_attn", "attn", "attention"):
+            if hasattr(lm_layer, n):
+                attn = getattr(lm_layer, n)
+                break
+
+        input_norm = None
+        for n in ("input_layernorm", "ln_1", "layernorm1", "norm1", "pre_attention_layernorm"):
+            if hasattr(lm_layer, n):
+                input_norm = getattr(lm_layer, n)
+                break
+
+        post_attn_norm = None
+        for n in ("post_attention_layernorm", "ln_2", "layernorm2", "norm2", "post_attention_norm"):
+            if hasattr(lm_layer, n):
+                post_attn_norm = getattr(lm_layer, n)
+                break
+
+        return attn, input_norm, post_attn_norm
+
+    def init_scoring_from_lm_model(self, lm_model: nn.Module, layer_indices: list, rms_norm_eps: Optional[float] = None):
+        """Initialize scoring layers from the provided downstream LM layers (best-effort)."""
         text_cfg = getattr(lm_model, 'config', None)
         hidden_size = getattr(text_cfg, 'hidden_size', self.d_model)
         num_heads = getattr(text_cfg, 'num_attention_heads', self.n_heads)
@@ -632,20 +713,17 @@ class QTSplus(nn.Module):
             self.n_heads = want_heads if can_use_lm_heads else self.n_heads
             self.d_head = self.d_model // self.n_heads
             self.scoring_layers = nn.ModuleList([
-                Qwen2_5_ScoringCrossAttentionLayer(
+                LMScoringCrossAttentionLayer(
                     self.d_model,
                     num_heads=self.n_heads,
                     num_key_value_heads=int(num_kv_heads),
                     dropout=0.0,
                     rms_norm_eps=rms_norm_eps,
-                    use_qwen_rms=True,
                 ) for _ in range(self.n_scoring_layers)
             ])
 
         # Collect LM layers and copy
-        lm_layers = list(getattr(lm_model, 'layers', []))
-        if not lm_layers and hasattr(lm_model, 'model') and hasattr(lm_model.model, 'layers'):
-            lm_layers = list(lm_model.model.layers)
+        lm_layers = self._collect_lm_decoder_layers(lm_model)
         if not lm_layers:
             return  # can't proceed
 
@@ -653,16 +731,14 @@ class QTSplus(nn.Module):
             idx = int(layer_indices[i]) if i < len(layer_indices) else int(layer_indices[-1])
             idx = max(0, min(idx, len(lm_layers) - 1))
             q_layer = lm_layers[idx]
-            if hasattr(q_layer, 'self_attn'):
-                layer.init_from_qwen_attn(q_layer.self_attn, getattr(q_layer, 'input_layernorm', None))
-        print("Qwen scoring layers initialized from LM model (where shapes matched).")
+            attn, in_norm, post_norm = self._extract_lm_layer_components(q_layer)
+            if attn is None:
+                continue
+            layer.init_from_lm_attn(attn, lm_input_norm=in_norm, lm_post_attn_norm=post_norm)
+        print("[QTS+] Scoring layers initialized from downstream LM model (where shapes matched).")
 
-    def init_qwen_reencode_from_lm_model(self, lm_model: nn.Module, layer_indices: list, rms_norm_eps: Optional[float] = None):
-        """
-        Initialize re-encoding self-attention layers from a loaded Qwen2.5 text model.
-        This rebuilds reencode layers to Qwen-style if necessary and copies projections
-        from the specified LM layer indices.
-        """
+    def init_reencode_from_lm_model(self, lm_model: nn.Module, layer_indices: list, rms_norm_eps: Optional[float] = None):
+        """Initialize re-encoding self-attention layers from downstream LM layers (best-effort)."""
         if not self.use_reencode:
             return
 
@@ -673,7 +749,7 @@ class QTSplus(nn.Module):
         if rms_norm_eps is None:
             rms_norm_eps = getattr(text_cfg, 'rms_norm_eps', 1e-6)
 
-        # Rebuild reencode layers as Qwen-style self-attn if needed
+        # Rebuild re-encode layers if head/kv-head config differs
         can_use_lm_heads = (self.d_model % int(num_heads)) == 0
         # Detect current kv heads from the first reencode layer (wrapper -> core)
         cur_kv_heads = None
@@ -690,20 +766,17 @@ class QTSplus(nn.Module):
                 self.n_heads = int(num_heads)
                 self.d_head = self.d_model // self.n_heads
             self.reencode_layers = nn.ModuleList([
-                Qwen2_5_SelfReencodeLayer(
+                LMSelfReencodeLayer(
                     self.d_model,
                     num_heads=self.n_heads,
                     num_key_value_heads=int(num_kv_heads),
                     dropout=0.0,
                     rms_norm_eps=rms_norm_eps,
-                    use_qwen_rms=True,
                 ) for _ in range(self.n_reencode_layers)
             ])
 
         # Collect LM layers and copy
-        lm_layers = list(getattr(lm_model, 'layers', []))
-        if not lm_layers and hasattr(lm_model, 'model') and hasattr(lm_model.model, 'layers'):
-            lm_layers = list(lm_model.model.layers)
+        lm_layers = self._collect_lm_decoder_layers(lm_model)
         if not lm_layers:
             return
 
@@ -711,6 +784,8 @@ class QTSplus(nn.Module):
             idx = int(layer_indices[i]) if i < len(layer_indices) else int(layer_indices[-1])
             idx = max(0, min(idx, len(lm_layers) - 1))
             q_layer = lm_layers[idx]
-            if hasattr(q_layer, 'self_attn') and hasattr(layer, 'init_from_qwen_attn'):
-                layer.init_from_qwen_attn(q_layer.self_attn, getattr(q_layer, 'input_layernorm', None))
-        print("Qwen re-encode layers initialized from LM model (where shapes matched).")
+            attn, in_norm, post_norm = self._extract_lm_layer_components(q_layer)
+            if attn is None:
+                continue
+            layer.init_from_lm_attn(attn, lm_input_norm=in_norm, lm_post_attn_norm=post_norm)
+        print("[QTS+] Re-encode layers initialized from downstream LM model (where shapes matched).")

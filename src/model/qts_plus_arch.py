@@ -69,16 +69,17 @@ def qts_integrate_embeddings(
     # Replicate the masked_scatter approach from Qwen2_5_VLForConditionalGeneration
     if vision_features.shape[0] <= 0:
         raise ValueError("vision_features must contain at least one feature vector")
-    # Check for video tokens and replace them with vision features
-    if video_token_id is None:
-        raise ValueError("video_token_id must be provided for video feature integration")
+    # Select the placeholder token used for vision feature integration.
+    placeholder_token_id = video_token_id if video_token_id is not None else image_token_id
+    if placeholder_token_id is None:
+        raise ValueError("Either video_token_id or image_token_id must be provided for vision feature integration")
 
     # batch-size == 1 variant (current pipeline constructs single-sample batches)
     B, S = input_ids.shape
     assert B == 1, "Sequence-trimming currently assumes batch_size == 1."
 
-    # Locate all video placeholder positions in the text sequence
-    vid_pos = (input_ids[0] == video_token_id).nonzero(as_tuple=False).flatten()
+    # Locate all placeholder positions in the text sequence
+    vid_pos = (input_ids[0] == int(placeholder_token_id)).nonzero(as_tuple=False).flatten()
 
     # Fast-path for the new dataset behavior: a single <|video_pad|> token
     # Expand that single placeholder into the full sequence of selected
@@ -121,7 +122,7 @@ def qts_integrate_embeddings(
         # features onto existing placeholders, trimming extras on either side.
         M = int(vid_pos.numel())
         if M == 0:
-            raise ValueError("No video placeholder tokens found in input_ids for provided vision_features")
+            raise ValueError("No vision placeholder tokens found in input_ids for provided vision_features")
 
         # Align dtypes/devices
         vision_features = vision_features.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -129,11 +130,32 @@ def qts_integrate_embeddings(
         N = n_feats  # number of visual features
         # If we have more features than placeholders, keep the first M features
         if N > M:
-            raise NotImplementedError("Number of vision features exceeds video placeholders; please use single <|video_pad|> token templates.")
+            raise NotImplementedError(
+                "Number of vision features exceeds placeholder tokens; please ensure the prompt inserts enough placeholders."
+            )
 
         # If we have fewer features than placeholders, drop the extra placeholders
         if N < M:
-            drop_pos = vid_pos[N:]
+            # If selection indices are provided (e.g., InternVL `<IMG_CONTEXT>` tokens),
+            # drop *unselected* placeholders to preserve original positional layout.
+            if kept_indices is not None:
+                keep_idx = kept_indices.flatten().to(device=vid_pos.device)
+                # Best-effort sanitize indices to the placeholder range.
+                keep_idx = keep_idx[(keep_idx >= 0) & (keep_idx < M)]
+                if keep_idx.numel() != N:
+                    # Fall back to keeping the first N placeholders if indices are inconsistent.
+                    keep_idx = torch.arange(N, device=vid_pos.device, dtype=torch.long)
+                # Ensure deterministic ordering; align feature order to sorted kept indices.
+                order = torch.argsort(keep_idx)
+                keep_idx = keep_idx[order]
+                vision_features = vision_features[order.to(device=vision_features.device)]
+
+                keep_ctx = torch.zeros((M,), device=vid_pos.device, dtype=torch.bool)
+                keep_ctx[keep_idx] = True
+                drop_pos = vid_pos[~keep_ctx]
+            else:
+                # Default behavior (legacy): keep a prefix of placeholders.
+                drop_pos = vid_pos[N:]
             if drop_pos.numel() > 0:
                 keep_seq = torch.ones(S, dtype=torch.bool, device=input_ids.device)
                 keep_seq[drop_pos] = False
@@ -142,8 +164,8 @@ def qts_integrate_embeddings(
                 inputs_embeds = inputs_embeds[:, keep_seq, :]
                 if labels is not None:
                     labels = labels[:, keep_seq]
-                # Recompute video positions after dropping
-                vid_pos = (input_ids[0] == video_token_id).nonzero(as_tuple=False).flatten()
+                # Recompute placeholder positions after dropping
+                vid_pos = (input_ids[0] == int(placeholder_token_id)).nonzero(as_tuple=False).flatten()
                 M = int(vid_pos.numel())
                 # By construction, M == N now
 
@@ -165,6 +187,9 @@ class QTSplusMetaModel:
         super(QTSplusMetaModel, self).__init__(config)
 
         self.config = config
+        # Optional projector to align vision hidden size to LM hidden size.
+        # Named `mm_projector` to match common multimodal conventions.
+        self.mm_projector: Optional[nn.Module] = getattr(self, "mm_projector", None)
 
         if hasattr(config, "vision_tower"):
             # Defer QTS+ build until we know the vision out_hidden_size to set a correct embedding dim
@@ -176,9 +201,29 @@ class QTSplusMetaModel:
                 vt = getattr(self, "vision_tower", None)
                 out_hidden = getattr(getattr(vt, "config", None), "out_hidden_size", None)
                 if isinstance(out_hidden, int) and out_hidden > 0:
-                    self.config.vision_embed_size = out_hidden
+                    # Track native vision tower output dim separately; QTS+/LM integration
+                    # operates in LM hidden_size space (see initialize_vision_modules).
+                    self.config.vision_tower_embed_size = out_hidden
+                    lm_hidden = getattr(self.config, "hidden_size", None)
+                    self.config.vision_embed_size = int(lm_hidden) if isinstance(lm_hidden, int) and lm_hidden > 0 else out_hidden
             except Exception:
                 pass
+
+        # Build/refresh mm_projector if a saved config indicates a mismatch.
+        try:
+            vt = getattr(self, "vision_tower", None)
+            vt_out = getattr(getattr(vt, "config", None), "out_hidden_size", None)
+            lm_hidden = getattr(self.config, "hidden_size", None)
+            if isinstance(vt_out, int) and vt_out > 0 and isinstance(lm_hidden, int) and lm_hidden > 0 and vt_out != lm_hidden:
+                cur = getattr(self, "mm_projector", None)
+                if not isinstance(cur, nn.Linear) or cur.in_features != vt_out or cur.out_features != lm_hidden:
+                    self.mm_projector = nn.Linear(vt_out, lm_hidden, bias=False)
+                    with torch.no_grad():
+                        self.mm_projector.weight.zero_()
+                        d = min(vt_out, lm_hidden)
+                        self.mm_projector.weight[:d, :d] = torch.eye(d)
+        except Exception:
+            pass
 
         # Build QTS+ tower early if enabled so that its parameters exist during
         # from_pretrained weight loading. This prevents "unused weights" warnings
@@ -202,6 +247,8 @@ class QTSplusMetaModel:
         return vision_tower
 
     def initialize_vision_modules(self, model_args):
+        had_qts_plus = self.get_qts_plus_tower() is not None
+
         # vision config
         self.config.vision_tower = model_args.vision_tower
         # Pass through pretrained path so the builder can infer correct sizes
@@ -209,9 +256,13 @@ class QTSplusMetaModel:
 
         # qts_plus config
         self.config.enable_qts_plus = model_args.enable_qts_plus
-        self.config.embedding_dim = model_args.lm_embed_size
-        # Set a tentative vision embed size, will sync with actual tower config below
-        self.config.vision_embed_size = model_args.vision_embed_size
+        # Prefer the downstream LM hidden size for QTS+/integration space; fall back to CLI arg.
+        lm_hidden = getattr(self.config, "hidden_size", None)
+        if not isinstance(lm_hidden, int) or lm_hidden <= 0:
+            lm_hidden = int(getattr(model_args, "lm_embed_size", 0) or 0)
+        self.config.embedding_dim = lm_hidden
+        # QTS+ operates in LM hidden space (after optional mm_projector).
+        self.config.vision_embed_size = lm_hidden
         self.config.project_text_if_needed = model_args.project_text_if_needed
         self.config.qts_plus_n_heads = model_args.qts_plus_n_heads
         self.config.qts_plus_tau_s = model_args.qts_plus_tau_s
@@ -237,18 +288,35 @@ class QTSplusMetaModel:
         if self.get_vision_tower() is None:
             self.vision_tower = build_vision_tower(self.config)
 
-        # Sync the effective vision embedding size from the actual tower config (if available)
+        # Track native vision tower output size (for potential projection into LM space)
         vt = self.get_vision_tower()
         out_hidden = getattr(getattr(vt, 'config', None), 'out_hidden_size', None)
         if isinstance(out_hidden, int) and out_hidden > 0:
-            self.config.vision_embed_size = out_hidden
+            self.config.vision_tower_embed_size = out_hidden
+
+        # Build/refresh mm_projector when vision dim != LM hidden size.
+        try:
+            vt_out = int(getattr(self.config, "vision_tower_embed_size", 0) or 0)
+            lm_out = int(getattr(self.config, "vision_embed_size", 0) or 0)
+            if vt_out > 0 and lm_out > 0 and vt_out != lm_out:
+                cur = getattr(self, "mm_projector", None)
+                if not isinstance(cur, nn.Linear) or cur.in_features != vt_out or cur.out_features != lm_out:
+                    self.mm_projector = nn.Linear(vt_out, lm_out, bias=False)
+                    with torch.no_grad():
+                        self.mm_projector.weight.zero_()
+                        d = min(vt_out, lm_out)
+                        self.mm_projector.weight[:d, :d] = torch.eye(d)
+        except Exception:
+            pass
 
         # qts_plus tower — build only after vision embed size and scoring_layers are finalized
         if self.get_qts_plus_tower() is None and model_args.enable_qts_plus:
             self.qts_plus = build_qts_plus_tower(self.config)
+        qts = self.get_qts_plus_tower()
+        built_qts_plus_here = (not had_qts_plus) and (qts is not None)
 
         if model_args.pretrain_vision_model is not None:
-            if self.config.vision_tower == 'qwen2_5_vl_vision':
+            if self.config.vision_tower in {'qwen2_5_vl_vision', 'internvl2_5_vision', 'internvl_vision', 'llava_siglip_vision'}:
                 # Load from directory or file robustly
                 from safetensors.torch import load_file
                 v_path = model_args.pretrain_vision_model
@@ -279,18 +347,23 @@ class QTSplusMetaModel:
         # If you have a more robust vision encoder, try freezing the vision tower by requires_grad_(False)
         self.vision_tower.requires_grad_(not model_args.freeze_vision_model)
 
-        # Always initialize from the loaded LM by default
-        n_layers = int(getattr(self.config, 'num_hidden_layers', 0))
-        default_sc_idx = max(0, n_layers - 1)
-        sc_count = max(1, int(self.config.qts_plus_scoring_layers))
-        sc_init_indices = [default_sc_idx for _ in range(sc_count)]
-        qts = self.get_qts_plus_tower()
-        qts.selector.init_qwen_scoring_from_lm_model(self, sc_init_indices)
+        # Initialize QTS+ scoring/re-encode layers from the loaded LM only when QTS+
+        # is newly created (fresh run). If QTS+ already existed (e.g., loaded from a
+        # checkpoint), keep the checkpoint weights and do not overwrite them here.
+        if qts is not None and getattr(self.config, "resume_from_checkpoint", False):
+            init_pref = getattr(model_args, "init_qts_from_lm", None)
+            init_from_lm = built_qts_plus_here if init_pref is None else bool(init_pref)
+            if init_from_lm:
+                n_layers = int(getattr(self.config, 'num_hidden_layers', 0))
+                default_sc_idx = max(0, n_layers - 1)
+                sc_count = max(1, int(self.config.qts_plus_scoring_layers))
+                sc_init_indices = [default_sc_idx for _ in range(sc_count)]
+                qts.selector.init_scoring_from_lm_model(self, sc_init_indices)
 
-        if getattr(self.config, 'qts_plus_reencode', True):
-            re_count = max(1, int(self.config.qts_plus_reencode_layers))
-            re_init_indices = [min(i, max(0, n_layers - 1)) for i in range(re_count)]
-            qts.selector.init_qwen_reencode_from_lm_model(self, re_init_indices)
+                if getattr(self.config, 'qts_plus_reencode', True):
+                    re_count = max(1, int(self.config.qts_plus_reencode_layers))
+                    re_init_indices = [min(i, max(0, n_layers - 1)) for i in range(re_count)]
+                    qts.selector.init_reencode_from_lm_model(self, re_init_indices)
 
 
 class QTSplusMetaForCausalLM(ABC):
@@ -318,6 +391,7 @@ class QTSplusMetaForCausalLM(ABC):
         labels,
         question_input_ids: Optional[torch.Tensor] = None,
         video_token_id: Optional[int] = None,
+        image_token_id: Optional[int] = None,
         mode: str = 'train',
     ):
         vision_tower = self.get_vision_tower()
@@ -328,7 +402,8 @@ class QTSplusMetaForCausalLM(ABC):
             flops_loss = torch.tensor(0.0, device=input_ids.device)
             kv_loss = torch.tensor(0.0, device=input_ids.device)
             smooth_loss = torch.tensor(0.0, device=input_ids.device)
-            return input_ids, position_ids, attention_mask, past_key_values, None, labels, flops_loss, kv_loss, smooth_loss
+            # First return value is `vision_input` (matches model wrapper unpacking).
+            return vision_input, position_ids, attention_mask, past_key_values, None, labels, flops_loss, kv_loss, smooth_loss
         else:
             if self.config.enable_qts_plus:
                 if self.config.vision_tower == 'qwen2_5_vl_vision':
@@ -339,7 +414,7 @@ class QTSplusMetaForCausalLM(ABC):
                             flops_loss = torch.tensor(0.0, device=input_ids.device)
                             kv_loss = torch.tensor(0.0, device=input_ids.device)
                             smooth_loss = torch.tensor(0.0, device=input_ids.device)
-                            return input_ids, position_ids, attention_mask, past_key_values, None, labels, flops_loss, kv_loss, smooth_loss
+                            return None, position_ids, attention_mask, past_key_values, None, labels, flops_loss, kv_loss, smooth_loss
                         vision_input = vision_input[0]
 
                     vision_features = vision_tower.get_video_features(
@@ -359,7 +434,17 @@ class QTSplusMetaForCausalLM(ABC):
                     if question_input_ids is not None and question_input_ids.dtype is not torch.long:
                         question_input_ids = question_input_ids.long()
                     text_embeddings = text_embed_layer(question_input_ids)
-                    vision_features = vision_features.to(dtype=text_embeddings.dtype)
+                    # Align dtype/device for projection + QTS+.
+                    vision_features = vision_features.to(device=text_embeddings.device, dtype=text_embeddings.dtype)
+
+                    # Optional projector to map native vision features into LM hidden space.
+                    mm_proj = getattr(self.get_model(), "mm_projector", None)
+                    if mm_proj is not None:
+                        try:
+                            mm_proj = mm_proj.to(device=vision_features.device, dtype=vision_features.dtype)
+                        except Exception:
+                            mm_proj = mm_proj.to(device=vision_features.device)
+                        vision_features = mm_proj(vision_features)
 
                     qts_plus_out = qts_plus_tower(vision_features, text_embeddings, mode=mode)
                     vision_features = qts_plus_out["Z"]
@@ -419,6 +504,178 @@ class QTSplusMetaForCausalLM(ABC):
                         }
                     except Exception:
                         pass
+                elif self.config.vision_tower in {'internvl2_5_vision', 'internvl_vision'}:
+                    # Handle collated list case from DataCollator
+                    if isinstance(vision_input, list):
+                        if len(vision_input) == 0:
+                            flops_loss = torch.tensor(0.0, device=input_ids.device)
+                            kv_loss = torch.tensor(0.0, device=input_ids.device)
+                            smooth_loss = torch.tensor(0.0, device=input_ids.device)
+                            return None, position_ids, attention_mask, past_key_values, None, labels, flops_loss, kv_loss, smooth_loss
+                        vision_input = vision_input[0]
+
+                    # Accept both dict-like and raw tensor `vision_input`
+                    pixel_values = None
+                    if isinstance(vision_input, dict):
+                        pixel_values = vision_input.get("pixel_values", None)
+                    else:
+                        pixel_values = vision_input
+                    if pixel_values is None:
+                        raise ValueError("InternVL vision_tower requires `vision_input['pixel_values']` (or a tensor).")
+
+                    if question_input_ids is None:
+                        assert False, "question_input_ids must be provided in training to avoid data leakage"
+                    if question_input_ids is not None and question_input_ids.dtype is not torch.long:
+                        question_input_ids = question_input_ids.long()
+                    if isinstance(question_input_ids, torch.Tensor) and question_input_ids.ndim == 1:
+                        question_input_ids = question_input_ids.unsqueeze(0)
+
+                    # Normalize InternVL vision inputs:
+                    # - image: [B, 3, H, W] or [3, H, W]
+                    # - video frames: [B, T, 3, H, W] (collated) or [T, 3, H, W] (single sample)
+                    if not isinstance(pixel_values, torch.Tensor):
+                        raise ValueError(f"InternVL vision_input must be a torch.Tensor, got {type(pixel_values)}")
+
+                    if pixel_values.ndim == 3:  # [3, H, W]
+                        pixel_values = pixel_values.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
+                    elif pixel_values.ndim == 4:  # [B, 3, H, W] or [T, 3, H, W]
+                        b_txt = int(question_input_ids.shape[0]) if isinstance(question_input_ids, torch.Tensor) and question_input_ids.ndim >= 2 else 1
+                        if pixel_values.shape[0] == b_txt:
+                            pixel_values = pixel_values.unsqueeze(1)  # [B, 1, 3, H, W]
+                        else:
+                            pixel_values = pixel_values.unsqueeze(0)  # [1, T, 3, H, W]
+                    elif pixel_values.ndim != 5:
+                        raise ValueError(f"Unsupported InternVL pixel_values shape: {tuple(pixel_values.shape)}")
+
+                    b, t, c, h, w = pixel_values.shape
+                    pixel_values_flat = pixel_values.reshape(b * t, c, h, w)
+
+                    vision_features = vision_tower.get_image_features(pixel_values_flat.to(vision_tower.device))
+                    if isinstance(vision_features, torch.Tensor) and vision_features.ndim == 2:
+                        vision_features = vision_features.unsqueeze(0)
+                    if not (isinstance(vision_features, torch.Tensor) and vision_features.ndim == 3):
+                        raise ValueError(f"InternVL vision tower must return [B, N, D], got: {type(vision_features)}")
+                    # Merge frame dimension into token dimension so QTS+/integration sees one sample: [B, T*N, D]
+                    vision_features = vision_features.reshape(b, t * vision_features.shape[1], vision_features.shape[2])
+
+                    text_embeddings = text_embed_layer(question_input_ids)
+
+                    vision_features = vision_features.to(device=text_embeddings.device, dtype=text_embeddings.dtype)
+                    mm_proj = getattr(self.get_model(), "mm_projector", None)
+                    if mm_proj is not None:
+                        try:
+                            mm_proj = mm_proj.to(device=vision_features.device, dtype=vision_features.dtype)
+                        except Exception:
+                            mm_proj = mm_proj.to(device=vision_features.device)
+                        vision_features = mm_proj(vision_features)
+
+                    qts_plus_out = qts_plus_tower(vision_features, text_embeddings, mode=mode)
+                    vision_features = qts_plus_out["Z"]
+                    flops_loss = qts_plus_out["add_loss"]["flops"]
+                    kv_loss = qts_plus_out["add_loss"]["kv"]
+                    smooth_loss = qts_plus_out["add_loss"]["smooth"]
+
+                    # Resolve image token id if not provided
+                    if image_token_id is None:
+                        image_token_id = getattr(self.config, "image_token_id", None)
+                        if image_token_id is None:
+                            # Default to InternVL <IMG_CONTEXT> token id
+                            image_token_id = 92546
+
+                    inputs_embeds, attention_mask, labels = qts_integrate_embeddings(
+                        vision_features=vision_features[0],
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        image_token_id=image_token_id,
+                        text_model_embed_layer=text_embed_layer,
+                        kept_indices=qts_plus_out.get("indices", [None])[0],
+                    )
+                elif self.config.vision_tower in {"llava_siglip_vision"}:
+                    # Handle collated list case from DataCollator
+                    if isinstance(vision_input, list):
+                        if len(vision_input) == 0:
+                            flops_loss = torch.tensor(0.0, device=input_ids.device)
+                            kv_loss = torch.tensor(0.0, device=input_ids.device)
+                            smooth_loss = torch.tensor(0.0, device=input_ids.device)
+                            return None, position_ids, attention_mask, past_key_values, None, labels, flops_loss, kv_loss, smooth_loss
+                        vision_input = vision_input[0]
+
+                    pixel_values = None
+                    if isinstance(vision_input, dict):
+                        pixel_values = vision_input.get("pixel_values", None)
+                    else:
+                        pixel_values = vision_input
+                    if pixel_values is None:
+                        raise ValueError("LLaVA SigLIP vision_tower requires `vision_input['pixel_values']` (or a tensor).")
+
+                    if question_input_ids is None:
+                        assert False, "question_input_ids must be provided in training to avoid data leakage"
+                    if question_input_ids is not None and question_input_ids.dtype is not torch.long:
+                        question_input_ids = question_input_ids.long()
+                    if isinstance(question_input_ids, torch.Tensor) and question_input_ids.ndim == 1:
+                        question_input_ids = question_input_ids.unsqueeze(0)
+
+                    if not isinstance(pixel_values, torch.Tensor):
+                        raise ValueError(f"LLaVA pixel_values must be a torch.Tensor, got {type(pixel_values)}")
+
+                    # Normalize shapes:
+                    # - image: [3, H, W] or [B, 3, H, W]
+                    # - video frames: [T, 3, H, W] or [B, T, 3, H, W]
+                    if pixel_values.ndim == 3:
+                        pixel_values = pixel_values.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
+                    elif pixel_values.ndim == 4:
+                        b_txt = int(question_input_ids.shape[0]) if question_input_ids.ndim >= 2 else 1
+                        if pixel_values.shape[0] == b_txt:
+                            pixel_values = pixel_values.unsqueeze(1)  # [B, 1, 3, H, W]
+                        else:
+                            pixel_values = pixel_values.unsqueeze(0)  # [1, T, 3, H, W]
+                    elif pixel_values.ndim != 5:
+                        raise ValueError(f"Unsupported LLaVA pixel_values shape: {tuple(pixel_values.shape)}")
+
+                    b, t, c, h, w = pixel_values.shape
+                    pixel_values_flat = pixel_values.reshape(b * t, c, h, w)
+
+                    vision_features = vision_tower.get_image_features(pixel_values_flat.to(vision_tower.device))
+                    if isinstance(vision_features, torch.Tensor) and vision_features.ndim == 2:
+                        vision_features = vision_features.unsqueeze(0)
+                    if not (isinstance(vision_features, torch.Tensor) and vision_features.ndim == 3):
+                        raise ValueError(f"LLaVA vision tower must return [B, N, D], got: {type(vision_features)}")
+                    vision_features = vision_features.reshape(b, t * vision_features.shape[1], vision_features.shape[2])
+
+                    text_embeddings = text_embed_layer(question_input_ids)
+                    vision_features = vision_features.to(device=text_embeddings.device, dtype=text_embeddings.dtype)
+
+                    mm_proj = getattr(self.get_model(), "mm_projector", None)
+                    if mm_proj is not None:
+                        try:
+                            mm_proj = mm_proj.to(device=vision_features.device, dtype=vision_features.dtype)
+                        except Exception:
+                            mm_proj = mm_proj.to(device=vision_features.device)
+                        vision_features = mm_proj(vision_features)
+
+                    qts_plus_out = qts_plus_tower(vision_features, text_embeddings, mode=mode)
+                    vision_features = qts_plus_out["Z"]
+                    flops_loss = qts_plus_out["add_loss"]["flops"]
+                    kv_loss = qts_plus_out["add_loss"]["kv"]
+                    smooth_loss = qts_plus_out["add_loss"]["smooth"]
+
+                    # Resolve image token id if not provided
+                    if image_token_id is None:
+                        image_token_id = getattr(self.config, "image_token_id", None)
+                        if image_token_id is None:
+                            # Default to LLaVA <image> token id for Qwen2 tokenizers
+                            image_token_id = 151646
+
+                    inputs_embeds, attention_mask, labels = qts_integrate_embeddings(
+                        vision_features=vision_features[0],
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        image_token_id=image_token_id,
+                        text_model_embed_layer=text_embed_layer,
+                        kept_indices=qts_plus_out.get("indices", [None])[0],
+                    )
             else:
                 raise ValueError("Not support this model")
         return vision_input, position_ids, attention_mask, past_key_values, inputs_embeds, labels, flops_loss, kv_loss, smooth_loss
@@ -474,6 +731,14 @@ class QTSplusMetaForCausalLM(ABC):
             te = text_embed(question_input_ids.to(text_embed.weight.device))
             if isinstance(vf, torch.Tensor):
                 vf = vf.to(device=te.device, dtype=te.dtype)
+                # Apply optional mm_projector (vision -> LM hidden space) before QTS+.
+                mm_proj = getattr(self.get_model(), "mm_projector", None)
+                if mm_proj is not None:
+                    try:
+                        mm_proj = mm_proj.to(device=vf.device, dtype=vf.dtype)
+                    except Exception:
+                        mm_proj = mm_proj.to(device=vf.device)
+                    vf = mm_proj(vf)
             try:
                 qts_tower.to(device=te.device, dtype=te.dtype)
             except Exception:

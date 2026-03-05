@@ -5,7 +5,7 @@ def build_qts_plus_tower(config, **kwargs):
     lm_heads = getattr(config, "num_attention_heads", None)
     vision_dim = getattr(config, "vision_embed_size", None)
     if not isinstance(lm_heads, int) or lm_heads <= 0:
-        raise ValueError("num_attention_heads must be provided by the Qwen2.5-VL config")
+        raise ValueError("num_attention_heads must be provided by the downstream LM config")
     if not isinstance(vision_dim, int) or vision_dim <= 0:
         raise ValueError("vision_embed_size must be a positive int before building QTS+")
     if vision_dim % lm_heads != 0:

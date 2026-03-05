@@ -38,7 +38,7 @@ class QTSplusTokenizerConfig:
     # Misc
     project_text_if_needed: bool = False
 
-    # Qwen weights are always used for initialization; no random-init toggles
+    # Scoring/re-encode layers can be initialized from downstream LM weights.
 
 
 class QTSplusTokenizer(nn.Module):

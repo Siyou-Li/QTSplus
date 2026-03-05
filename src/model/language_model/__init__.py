@@ -1,2 +1,5 @@
 from .qts_plus_qwen2_5_lm import QTSplusQwen2_5_VLTextForCausalLM
 from .qwen2_5_vl_text_for_causallm import Qwen2_5_VLTextForCausalLM
+from .qts_plus_llama_lm import QTSplusLlama3_ForCausalLM
+from .qts_plus_internlm2_lm import QTSplusInternLM2_ForCausalLM
+from .qts_plus_qwen2_lm import QTSplusQwen2_ForCausalLM

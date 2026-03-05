@@ -17,16 +17,18 @@ Despite the recent advances in the video understanding ability of multimodal lar
 Given a text query and video tokens, QTSplus dynamically selects the most important visual evidence for the input text query by (i) scoring visual tokens via cross-attention, (ii) predicting an instance-specific retention budget based on the complexity of the query, and (iii) selecting Top-n tokens. Furthermore, a small re-encoder preserves temporal order using absolute time information. Integrated into Qwen2.5-VL, QTSplus compresses the vision stream by up to 89% and reduces end-to-end latency by 28% on long videos.
 ```bash
 QTSplus/
-├── README.md, LICENSE, environment.txt
-├── assets/                     # logo and figures for the project
+├── README.md, LICENSE, environment.sh
+├── assets/                     # logos and figures for the project
+├── config/                     # accelerate/deepspeed configs
+├── evaluation/                 # inference & evaluation scripts
+├── script/                     # example launch scripts
 ├── src/
-│   ├── dataset/                # dataset classes & synthesis scripts
-│   ├── demo/                   # interactive/demo scripts
-│   ├── model/                  # vision towers, tokenizer, projectors, LLM wrappers
+│   ├── dataset/                # dataset loaders (VSCQ/VQA/LLaVA-Video-178K, etc.)
+│   ├── model/                  # vision towers, QTS+ tokenizer, LM wrappers
 │   ├── train/                  # training and fine‑tuning scripts
-│   └── utils/                  # misc helpers (vision preproc, dist utils, etc.)
-│── preprocess/             # data‑preprocessing utilities
-└── verify/                       # small smoke tests for models & pipelines
+│   └── utils/                  # helpers (vision preprocessing, model split, etc.)
+├── preprocess/                 # data-preprocessing utilities
+└── verify/                     # smoke tests for models & pipelines
 ```
 ## 🚀 Quick Start
 
@@ -258,15 +260,27 @@ which should print `True` on a correctly configured GPU machine.
 
 ### B. Prepare pretrained models
 
-Split Command:
 ```bash
-python -m src.utils.separate_qwen2_5_vl.py --model_path <path_to_model>
+# Qwen2.5-VL -> split into `*-LM` and `*-Vision` directories
+python src/utils/separate_qwen2_5_vl.py \
+  --model_path pretrained_models/Qwen2.5-VL-3B-Instruct
 ```
-- For example: Download `Qwen2.5-VL-3B-Instruct` and split it, and place the parts into:
-  - `<path_to_model>/Qwen2.5-VL-3B-Instruct-LM`
-  - `<path_to_model>/Qwen2.5-VL-3B-Instruct-Vision`
 
-Paths above are the defaults used by the example scripts; you can change them as long as you adjust the corresponding CLI arguments.
+This creates:
+- `pretrained_models/Qwen2.5-VL-3B-Instruct-LM`
+- `pretrained_models/Qwen2.5-VL-3B-Instruct-Vision`
+
+Optional (other backbones):
+
+```bash
+# InternVL2.5 -> split into `*-LM` and `*-Vision`
+python src/utils/separate_internvl2_5.py --model_path pretrained_models/InternVL2_5-8B
+
+# LLaVA-Video (Qwen2) -> split into `*-LM` and `*-Vision`
+python src/utils/separate_llava_video_qwen2.py --model_path pretrained_models/LLaVA-Video-7B-Qwen2
+```
+
+You can override output folders with `--lm_out` / `--vision_out` for all split scripts.
 
 Training QTSplus is handled by `src/train/train.py` together with `src/train/qts_plus_trainer.py`. The script is designed to be launched via `accelerate` and optionally `deepspeed`.
 
@@ -278,7 +292,7 @@ The file `script/training_example.sh` contains a concrete configuration for trai
   - `PROJECT_PATH` points to the root of this repository.
   - Pretrained models are under `pretrained_models/Qwen2.5-VL-3B-Instruct-LM` and `pretrained_models/Qwen2.5-VL-3B-Instruct-Vision`.
   - Datasets follow the structure described above.
-  - A valid `config/accelerate_config.yaml` exists (not shipped in the repo; you must create it using `accelerate config`).
+  - `config/accelerate_config.yaml` and `config/ds_config.json` are configured for your machine (the repo includes templates; update paths like `deepspeed_config_file` as needed).
 - It launches multi‑GPU training with:
 
 ```bash
@@ -307,7 +321,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --config_file $PROJECT_PATH/confi
 You should treat this script as a template and adapt:
 
 - `train_base_path` / `val_base_path` and JSONL paths to your local dataset.
-- `dataset_type` (`vscq` for multiple‑choice, `vqa` for open‑ended QA).
+- `dataset_type` (`vscq` for multiple‑choice, `vqa` for open‑ended QA, `llava-video-178k` for LLaVA‑Video‑178K JSONL format).
 - Hyperparameters such as `model_max_length`, learning rate, and QTSplus‑specific parameters (`qts_plus_tau_s`, `qts_plus_nmax`, `qts_plus_rho_min`, `qts_plus_rho_max`, etc.).
 
 ### D. Training logic
@@ -319,10 +333,10 @@ At a high level:
   - `DataArguments` (dataset paths and type).
   - `TrainingArguments` (standard HuggingFace training configuration plus LoRA options).
 - It initializes:
-  - The Qwen2.5‑VL tokenizer and vision processor.
-  - The base language model (`Qwen2_5_VLTextForCausalLM`) and wraps it with `QTSplusQwen2_5_VLTextForCausalLM`.
+  - The tokenizer / vision processor specified by `--lm_model_type` and `--vision_tower`.
+  - The base language model wrapper (e.g., `QTSplusQwen2_5_VLTextForCausalLM`).
   - The QTSplus selector, re‑encoder, and vision tower via `src/model/qts_plus_arch.py`.
-- Datasets are instantiated according to `dataset_type` (`vscq` or `vqa`) and wrapped in a custom `DataCollator`.
+- Datasets are instantiated according to `dataset_type` (`vscq`, `vqa`, or `llava-video-178k`) and use the generic video sampling flags (`--video_max_frames`, `--video_min_frames`, `--video_sampling`).
 - Training is driven by `QTSplusTrainer`, which:
   - Computes the standard causal‑LM loss.
   - Adds the auxiliary QTSplus losses (proxy FLOPs, KV‑cache, smoothness) with weights `lambda_t`, `lambda_m`, `lambda_s`.
@@ -362,7 +376,7 @@ The resource requirements depend strongly on the resolution, video length, and b
 - **Inference**
   - The demo script `evaluation/demo.py` supports both GPU and CPU devices (`--device cuda:0` or `--device cpu`), but CPU‑only inference will be significantly slower, especially for long videos.
 
-For the exact experimental setup and hardware used in the paper, please refer to the methodology and appendix sections of `res/qtsplus.pdf` and the associated arXiv version.
+For the exact experimental setup and hardware used in the paper, please refer to the methodology and appendix sections of the arXiv PDF (2511.11910).
 
 ## 🌟 Related Resources
 
